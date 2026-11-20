@@ -168,7 +168,7 @@ final class JobsMonitor: ObservableObject {
 
     func refresh() async {
         let command = "command -v squeue >/dev/null 2>&1 || { echo __NO_SLURM__; exit 0; }; squeue -u \"$USER\" -h -o '%i|%j|%T|%M|%l|%D|%R|%P'"
-        let result = await Shell.remote(host, command, timeout: 20)
+        let result = await slurm(command, timeout: 20)
         if result.status == 255 {
             status = .notConnected
             return
@@ -199,7 +199,7 @@ final class JobsMonitor: ObservableObject {
             progress = [:]
             return
         }
-        let result = await Shell.remote(host, Self.progressCommand(jobIDs: running), timeout: 20)
+        let result = await slurm(Self.progressCommand(jobIDs: running), timeout: 20)
         guard result.ok else { return }
         var parsed: [String: Progress] = [:]
         var current: String?
@@ -259,12 +259,21 @@ final class JobsMonitor: ObservableObject {
     }
 
     func cancel(_ job: Job) async {
-        let result = await Shell.remote(host, "scancel \(job.id)", timeout: 20)
+        let result = await slurm("scancel \(job.id)", timeout: 20)
         if !result.ok {
             detailTitle = "scancel \(job.id) failed"
             detailOutput = result.stderr
         }
         await refresh()
+    }
+
+    /// Non-interactive ssh commands skip the login profile, which is often what puts SLURM on PATH
+    /// (e.g. /opt/slurm/bin on UBC CS). Add the usual locations, then fall back to the login shell's PATH.
+    private static let slurmPathSetup = #"export PATH="$PATH:/opt/slurm/bin:/usr/local/slurm/bin:/cm/shared/apps/slurm/current/bin"; "#
+        + #"command -v squeue >/dev/null 2>&1 || PATH="$PATH:$("${SHELL:-sh}" -lc 'printf %s "$PATH"' </dev/null 2>/dev/null | tail -n 1)"; "#
+
+    private func slurm(_ command: String, timeout: TimeInterval) async -> CommandResult {
+        await Shell.remote(host, Self.slurmPathSetup + command, timeout: timeout)
     }
 
     func clearDetail() {
@@ -276,7 +285,7 @@ final class JobsMonitor: ObservableObject {
         detailTitle = title
         detailOutput = ""
         isRunningDetail = true
-        let result = await Shell.remote(host, command, timeout: 60)
+        let result = await slurm(command, timeout: 60)
         isRunningDetail = false
         let text = (result.stdout + (result.stderr.isEmpty ? "" : "\n" + result.stderr))
             .trimmingCharacters(in: .whitespacesAndNewlines)
