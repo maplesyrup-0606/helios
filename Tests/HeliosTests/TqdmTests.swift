@@ -23,6 +23,15 @@ final class TqdmTests: XCTestCase {
         XCTAssertEqual(p.postfix, "loss=0.123, lr=1e-4")
     }
 
+    func testGeodesicTrainBar() throws {
+        // Real line from a UBC CS loosek job's StdErr.
+        let p = try XCTUnwrap(JobsMonitor.parseTqdm("train:   4%|▍         | 409/10000 [01:45<39:13,  4.07it/s, active=0.109, loss=-0.0303, succ=0.0295]"))
+        XCTAssertEqual(p.fraction, 0.04, accuracy: 1e-9)
+        XCTAssertEqual(p.label, "train")
+        XCTAssertEqual(p.counts, "409/10000")
+        XCTAssertEqual(p.remaining, "39:13")
+    }
+
     func testStartOfRun() throws {
         let p = try XCTUnwrap(JobsMonitor.parseTqdm("  0%|          | 0/500 [00:00<?, ?it/s]"))
         XCTAssertEqual(p.fraction, 0)
