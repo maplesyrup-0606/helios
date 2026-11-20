@@ -76,13 +76,31 @@ struct Theme {
         "~/Library/Application Support/com.mitchellh.ghostty/config",
     ]
 
+    /// User themes first, then the ones bundled with Ghostty.app.
+    private static let themeDirs = [
+        "~/.config/ghostty/themes",
+        "~/Library/Application Support/com.mitchellh.ghostty/themes",
+        "/Applications/Ghostty.app/Contents/Resources/ghostty/themes",
+        "~/Applications/Ghostty.app/Contents/Resources/ghostty/themes",
+    ]
+
+    /// `theme = light:A,dark:B` picks B; Helios is dark-only.
+    private static func darkThemeName(_ value: String) -> String {
+        guard value.contains(":") else { return value }
+        for part in value.split(separator: ",") {
+            let pair = part.split(separator: ":", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+            if pair.count == 2, pair[0] == "dark" { return pair[1] }
+        }
+        return value
+    }
+
     static func loadGhostty() -> Theme {
         var theme = Theme()
         for path in configPaths {
             guard let text = try? String(contentsOfFile: expandTilde(path), encoding: .utf8) else { continue }
             // A named theme is applied first; explicit keys in the config override it.
-            if let name = values(in: text)["theme"]?.last {
-                for dir in ["~/.config/ghostty/themes", "~/Library/Application Support/com.mitchellh.ghostty/themes"] {
+            if let name = values(in: text)["theme"]?.last.map(darkThemeName) {
+                for dir in themeDirs {
                     if let themeText = try? String(contentsOfFile: expandTilde("\(dir)/\(name)"), encoding: .utf8) {
                         theme.merge(values(in: themeText))
                         break

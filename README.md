@@ -132,7 +132,65 @@ When Helios isn't the active app it also bounces the Dock icon and posts a notif
 
 ### Theme
 
-Colors and font come from your [Ghostty](https://ghostty.org) config (`~/.config/ghostty/config` or `~/Library/Application Support/com.mitchellh.ghostty/config`, plus its `theme =` file): `background`, `foreground`, `palette` 0–15, `cursor-color`, `selection-background`, `font-family` and `font-size`. The sidebar, header and borders are derived from the same colors. Restart Helios after changing the config. Without a Ghostty config, Helios uses its built-in dark theme.
+Helios reads colors and font from a [Ghostty](https://ghostty.org)-format config at `~/.config/ghostty/config` (or `~/Library/Application Support/com.mitchellh.ghostty/config`). You don't need Ghostty installed; Helios only reads the file. The sidebar, header and borders are derived from the same colors. Without a config, Helios uses its built-in dark theme. **Restart Helios after changing the config.**
+
+The keys it reads:
+
+```ini
+# Optional named theme; the keys below override it.
+theme = Dracula
+background = #282a36
+foreground = #f8f8f2
+cursor-color = #f8f8f2
+selection-background = #44475a
+# ANSI colors 0–15, one line each.
+palette = 0=#21222c
+palette = 1=#ff5555
+# … through palette = 15
+font-family = JetBrains Mono
+font-size = 13
+```
+
+Colors must be 6-digit hex (`#rrggbb`), and comments go on their own line. For `theme = light:A,dark:B`, Helios uses the dark one.
+
+#### Bringing your theme from another terminal
+
+**Ghostty:** nothing to do. Helios uses your config, including built-in theme names like `theme = Catppuccin Mocha`.
+
+**A popular theme (Dracula, Nord, Gruvbox, Catppuccin, Solarized, Tokyo Night…) in iTerm2, Kitty, Alacritty, WezTerm or Terminal.app:** most of these come from the [iTerm2-Color-Schemes](https://github.com/mbadolato/iTerm2-Color-Schemes) collection, which publishes every theme in Ghostty format. Find yours in its [`ghostty/` folder](https://github.com/mbadolato/iTerm2-Color-Schemes/tree/master/ghostty), then download it and select it by name:
+
+```sh
+mkdir -p ~/.config/ghostty/themes
+curl -fsSL "https://raw.githubusercontent.com/mbadolato/iTerm2-Color-Schemes/master/ghostty/Dracula" \
+  -o ~/.config/ghostty/themes/Dracula
+echo 'theme = Dracula' >> ~/.config/ghostty/config
+```
+
+(If Ghostty.app is installed, its ~460 bundled themes work by name without downloading.)
+
+**Kitty, custom colors:** convert your kitty config's colors in one go (point it at the file that defines your colors, e.g. `current-theme.conf` if you use `kitten themes`):
+
+```sh
+mkdir -p ~/.config/ghostty
+awk '$1 ~ /^color[0-9]+$/ { print "palette = " substr($1, 6) "=" $2 }
+     $1 == "background" || $1 == "foreground" { print $1 " = " $2 }
+     $1 == "cursor" { print "cursor-color = " $2 }
+     $1 == "selection_background" { print "selection-background = " $2 }' \
+  ~/.config/kitty/kitty.conf >> ~/.config/ghostty/config
+```
+
+**Any other terminal, custom colors:** copy the hex values across by hand using this table.
+
+| Helios / Ghostty | iTerm2 (Settings → Profiles → Colors) | Kitty | Alacritty | WezTerm |
+|---|---|---|---|---|
+| `background` | Background | `background` | `colors.primary.background` | `background` |
+| `foreground` | Foreground | `foreground` | `colors.primary.foreground` | `foreground` |
+| `cursor-color` | Cursor | `cursor` | `colors.cursor.cursor` | `cursor_bg` |
+| `selection-background` | Selection | `selection_background` | `colors.selection.background` | `selection_bg` |
+| `palette = 0`…`7` | ANSI Black…White (normal) | `color0`…`color7` | `colors.normal.black`…`white` | `ansi[1]`…`ansi[8]` |
+| `palette = 8`…`15` | ANSI Black…White (bright) | `color8`…`color15` | `colors.bright.black`…`white` | `brights[1]`…`brights[8]` |
+
+The ANSI order is black, red, green, yellow, blue, magenta, cyan, white. In iTerm2, clicking a color swatch shows its hex value in the color picker.
 
 ## Troubleshooting
 
