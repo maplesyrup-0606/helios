@@ -7,8 +7,8 @@ One window, many research contexts. Each tab pairs a **local terminal** (usually
 ```sh
 swift run                         # dev
 ./scripts/build-app.sh            # -> build/Helios.app
-./scripts/build-app.sh --install  # also copies to ~/Applications
-./scripts/relaunch.sh            # quit Helios, wait for it to exit, reopen build/Helios.app
+./scripts/build-app.sh --install  # also installs to /Applications (Spotlight, Launchpad, Dock)
+./scripts/relaunch.sh            # quit Helios, wait for it to exit, reopen (installed copy if present)
 ```
 
 Requires macOS 14+ and the Xcode toolchain. Terminal emulation is [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm), pinned to 1.20.0 (1.99.x doesn't compile with Swift 6.2).
