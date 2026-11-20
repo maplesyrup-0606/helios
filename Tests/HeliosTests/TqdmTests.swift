@@ -62,3 +62,22 @@ final class ClaudeHistoryTests: XCTestCase {
         XCTAssertEqual(ClaudeHistory.startupCommand(for: ctx), "claude")
     }
 }
+
+final class LocalTabTests: XCTestCase {
+    func testPrimaryLocalTabKeepsLegacySessionName() throws {
+        // A context saved before local sub-tabs existed (no "localTabs" key).
+        let json = #"{"id":"EA351623-9A5F-422E-A240-545338666EAB","name":"geodesic","localDir":"~/x","startupCommand":"claude"}"#
+        let ctx = try JSONDecoder().decode(WorkContext.self, from: Data(json.utf8))
+        XCTAssertEqual(ctx.localTabs.count, 1)
+        XCTAssertEqual(ctx.localTabs[0].name, "claude")
+        XCTAssertEqual(ctx.localTmuxSession(for: ctx.localTabs[0]), "helios-local-ea351623")
+    }
+
+    func testExtraLocalTabsGetDistinctSessions() {
+        var ctx = WorkContext(name: "t", localDir: "~")
+        ctx.localTabs.append(PaneTab(name: "shell 2"))
+        let names = Set(ctx.localTabs.map { ctx.localTmuxSession(for: $0) })
+        XCTAssertEqual(names.count, 2)
+        XCTAssertTrue(names.allSatisfy { $0.hasPrefix("helios-local-") })
+    }
+}

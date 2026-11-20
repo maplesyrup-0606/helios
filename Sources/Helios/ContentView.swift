@@ -46,15 +46,20 @@ struct ContentView: View {
         .foregroundStyle(theme.text)
         .ignoresSafeArea()
         .alert(
-            "Close “\(model.closingRemoteTab?.name ?? "")”?",
-            isPresented: Binding(get: { model.closingRemoteTab != nil }, set: { if !$0 { model.closingRemoteTab = nil } }),
-            presenting: model.closingRemoteTab
-        ) { tab in
-            Button("Close Tab", role: .destructive) { model.closeRemoteTab(tab) }
+            "Close “\(model.closingTab?.tab.name ?? "")”?",
+            isPresented: Binding(get: { model.closingTab != nil }, set: { if !$0 { model.closingTab = nil } }),
+            presenting: model.closingTab
+        ) { closing in
+            Button("Close Tab", role: .destructive) { model.closeTab(closing.tab, side: closing.side) }
                 .keyboardShortcut(.defaultAction)
-            Button("Cancel", role: .cancel) { model.closingRemoteTab = nil; model.focusPane(remote: true) }
-        } message: { _ in
-            Text("This ends its tmux session on \(model.selected?.host ?? "the host") and anything running in it.")
+            Button("Cancel", role: .cancel) {
+                model.closingTab = nil
+                model.focusPane(remote: closing.side == .remote)
+            }
+        } message: { closing in
+            Text(closing.side == .remote
+                 ? "This ends its tmux session on \(model.selected?.host ?? "the host") and anything running in it."
+                 : "This ends its local tmux session and anything running in it.")
         }
         .sheet(item: $model.editing) { context in
             ContextEditor(draft: context, isNew: model.isNewContext)
@@ -332,20 +337,20 @@ private struct ContextDetail: View {
     /// Polling runs only for the visible context; becoming visible puts the cursor in its local pane.
     private func activate(_ active: Bool) {
         runtime.setActive(active)
-        if active { FocusTracker.shared.request(runtime.local.terminal) }
+        if active, let local = runtime.visibleLocal { FocusTracker.shared.request(local.terminal) }
     }
 
     private var panes: some View {
         ResizableSplit(axis: .horizontal, ratio: context.splitRatio,
                        onCommit: { ratio in model.update(context.id) { $0.splitRatio = ratio } }) {
-            LocalPane(context: context, session: runtime.local, isActive: isActive)
+            LocalPane(context: context, runtime: runtime, isActive: isActive)
         } second: {
             RemotePane(context: context, runtime: runtime, isActive: isActive)
         }
     }
 
     private func sendToSSH(_ text: String) {
-        guard let id = runtime.selectedRemoteTab, let session = runtime.remoteSessions[id] else { return }
+        guard let session = runtime.visibleSSH else { return }
         session.terminal.send(data: ArraySlice(Array(text.utf8)))
         FocusTracker.shared.request(session.terminal)
     }
@@ -353,31 +358,33 @@ private struct ContextDetail: View {
 
 private struct LocalPane: View {
     let context: WorkContext
-    @ObservedObject var session: LocalSession
+    @ObservedObject var runtime: ContextRuntime
     let isActive: Bool
     @ObservedObject private var focus = FocusTracker.shared
 
+    private var selectedTab: PaneTab? {
+        context.localTabs.first { $0.id == runtime.selectedLocalTab } ?? context.localTabs.first
+    }
+
     var body: some View {
-        Card(isFocused: focus.isFocused(session.terminal)) {
-            HStack(spacing: 8) {
-                Image(systemName: "laptopcomputer").font(.system(size: 10, weight: .medium)).foregroundStyle(theme.textFaint)
-                Text("local").font(.system(size: 11, weight: .semibold)).foregroundStyle(theme.textMuted)
-                Text(context.localDir)
-                    .font(theme.mono(10.5))
-                    .foregroundStyle(theme.textFaint)
-                    .lineLimit(1)
-                    .truncationMode(.head)
-                Spacer()
-                if !session.isRunning {
-                    Button("restart") { session.start() }
-                        .buttonStyle(.plain)
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(theme.accent)
+        Card(isFocused: runtime.visibleLocal.map { focus.isFocused($0.terminal) } ?? false) {
+            PaneTabStrip(side: .local, context: context, runtime: runtime)
+        } content: {
+            // Every opened sub-tab stays mounted; switching only changes which is visible.
+            ZStack {
+                ForEach(context.localTabs) { tab in
+                    if let session = runtime.localSessions[tab.id] {
+                        let visible = isActive && tab.id == selectedTab?.id
+                        TerminalSurface(view: session.terminal, isVisible: visible)
+                            .opacity(visible ? 1 : 0)
+                            .allowsHitTesting(visible)
+                    }
                 }
             }
-            .padding(.horizontal, 12)
-        } content: {
-            TerminalSurface(view: session.terminal, isVisible: isActive)
+            .onAppear {
+                // A saved sub-tab starts the first time it's shown (outside view updates).
+                if let tab = selectedTab, runtime.localSessions[tab.id] == nil { _ = runtime.localSession(for: tab) }
+            }
         }
     }
 }
@@ -390,7 +397,7 @@ private struct RemotePane: View {
     let isActive: Bool
     @ObservedObject private var focus = FocusTracker.shared
 
-    private var selectedTab: RemoteTab? {
+    private var selectedTab: PaneTab? {
         context.remoteTabs.first { $0.id == runtime.selectedRemoteTab } ?? context.remoteTabs.first
     }
 
@@ -414,10 +421,9 @@ private struct RemotePane: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         } else if let selected = selectedTab {
-            Card(isFocused: runtime.remoteSessions[selected.id].map { focus.isFocused($0.terminal) } ?? false) {
-                RemoteTabStrip(context: context, runtime: runtime)
+            Card(isFocused: runtime.visibleSSH.map { focus.isFocused($0.terminal) } ?? false) {
+                PaneTabStrip(side: .remote, context: context, runtime: runtime)
             } content: {
-                // Every opened sub-tab stays mounted; switching only changes which is visible.
                 ZStack {
                     ForEach(context.remoteTabs) { tab in
                         if let session = runtime.remoteSessions[tab.id] {
@@ -437,57 +443,66 @@ private struct RemotePane: View {
     }
 }
 
-private struct RemoteTabStrip: View {
+/// Card header for either pane: an icon, the sub-tab pills, and a + button.
+private struct PaneTabStrip: View {
     @EnvironmentObject private var model: AppModel
+    let side: PaneSide
     let context: WorkContext
     @ObservedObject var runtime: ContextRuntime
     @Namespace private var pill
-    @State private var renaming: RemoteTab?
+    @State private var renaming: PaneTab?
     @State private var newName = ""
+
+    private var tabs: [PaneTab] { context.tabs(side) }
+    private var selectedID: UUID? {
+        (side == .local ? runtime.selectedLocalTab : runtime.selectedRemoteTab) ?? tabs.first?.id
+    }
 
     var body: some View {
         HStack(spacing: 6) {
-            Image(systemName: "network").font(.system(size: 10, weight: .medium)).foregroundStyle(theme.textFaint)
+            Image(systemName: side == .local ? "laptopcomputer" : "network")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(theme.textFaint)
                 .padding(.leading, 4)
+                .help(side == .local ? context.localDir : context.host + (context.remoteDir.isEmpty ? "" : ":" + context.remoteDir))
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 2) {
-                    ForEach(Array(context.remoteTabs.enumerated()), id: \.element.id) { index, tab in
-                        RemoteTabButton(
+                    ForEach(Array(tabs.enumerated()), id: \.element.id) { index, tab in
+                        PaneTabButton(
                             tab: tab,
-                            session: runtime.remoteSessions[tab.id],
-                            isSelected: tab.id == (runtime.selectedRemoteTab ?? context.remoteTabs.first?.id),
+                            ssh: side == .remote ? runtime.remoteSessions[tab.id] : nil,
+                            local: side == .local ? runtime.localSessions[tab.id] : nil,
+                            isSelected: tab.id == selectedID,
                             canClose: index > 0,
                             namespace: pill,
-                            select: { select(tab) },
-                            close: { model.requestCloseRemoteTab(tab) },
+                            select: { model.selectTab(tab, side: side) },
+                            close: { model.requestCloseTab(tab, side: side) },
                             rename: { newName = tab.name; renaming = tab })
                     }
                 }
             }
-            IconButton(systemName: "plus", help: "New SSH tab (⇧⌘T)") { model.addRemoteTab() }
+            IconButton(systemName: "plus", help: side == .local ? "New local tab (⇧⌘T)" : "New SSH tab (⇧⌘T)") {
+                model.addTab(side)
+            }
         }
         .padding(.horizontal, 6)
         .alert("Rename tab", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
             TextField("Name", text: $newName)
             Button("Rename") {
                 if let tab = renaming, !newName.trimmingCharacters(in: .whitespaces).isEmpty {
-                    model.renameRemoteTab(tab, to: newName)
+                    model.renameTab(tab, side: side, to: newName)
                 }
                 renaming = nil
             }
             Button("Cancel", role: .cancel) { renaming = nil }
         }
     }
-
-    private func select(_ tab: RemoteTab) {
-        withAnimation(.snappy(duration: 0.2)) { runtime.selectedRemoteTab = tab.id }
-        if let session = runtime.session(for: tab) { FocusTracker.shared.request(session.terminal) }
-    }
 }
 
-private struct RemoteTabButton: View {
-    let tab: RemoteTab
-    let session: SSHSession?
+private struct PaneTabButton: View {
+    let tab: PaneTab
+    let ssh: SSHSession?
+    let local: LocalSession?
     let isSelected: Bool
     let canClose: Bool
     let namespace: Namespace.ID
@@ -498,10 +513,11 @@ private struct RemoteTabButton: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            if let session { TabStateDot(session: session) }
+            if let ssh { SSHStateDot(session: ssh) }
             Text(tab.name)
                 .font(theme.mono(11))
                 .foregroundStyle(isSelected ? theme.text : theme.textMuted)
+            if let local { LocalRestart(session: local) }
             if canClose {
                 Button(action: close) {
                     Image(systemName: "xmark").font(.system(size: 8, weight: .bold))
@@ -509,7 +525,7 @@ private struct RemoteTabButton: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(theme.textFaint)
                 .opacity(isHovered ? 1 : 0)
-                .help("Close tab and kill its tmux session")
+                .help("Close tab and end its tmux session")
             }
         }
         .padding(.horizontal, 10)
@@ -532,11 +548,24 @@ private struct RemoteTabButton: View {
         }
     }
 
-    private struct TabStateDot: View {
+    private struct SSHStateDot: View {
         @ObservedObject var session: SSHSession
         var body: some View {
             let c = color(for: session.state)
             Circle().fill(c).frame(width: 6, height: 6).shadow(color: c.opacity(0.7), radius: 2)
+        }
+    }
+
+    /// Shown only when the tab's shell has exited.
+    private struct LocalRestart: View {
+        @ObservedObject var session: LocalSession
+        var body: some View {
+            if !session.isRunning {
+                Button("restart") { session.start() }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(theme.accent)
+            }
         }
     }
 }
@@ -724,16 +753,22 @@ private struct TerminalSurface: View {
 final class FocusTracker: ObservableObject {
     static let shared = FocusTracker()
     @Published private(set) var focused: ObjectIdentifier?
+    /// The focused view itself, for working out which pane it belongs to.
+    private(set) weak var focusedView: NSView?
     private var observations: [ObjectIdentifier: NSKeyValueObservation] = [:]
 
     func watch(_ window: NSWindow) {
         let key = ObjectIdentifier(window)
         guard observations[key] == nil else { return }
         observations[key] = window.observe(\.firstResponder, options: [.initial, .new]) { [weak self] window, _ in
+            let responderView = window.firstResponder as? NSView
             let responder = window.firstResponder.map(ObjectIdentifier.init)
             // Deliver on the next tick: first-responder changes can happen inside SwiftUI view
             // updates, and publishing there is undefined behavior (stale/missed redraws).
-            DispatchQueue.main.async { self?.focused = responder }
+            DispatchQueue.main.async {
+                self?.focusedView = responderView
+                self?.focused = responder
+            }
         }
     }
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Quits Helios, waits until it has fully exited, then reopens it
-# (the installed /Applications copy if there is one, else ./build).
+# (the installed /Applications copy if there is one, else ./build.noindex).
 # (Running `open` while the old copy is still quitting silently does nothing.)
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -13,5 +13,5 @@ done
 if [[ -d /Applications/Helios.app ]]; then
     open /Applications/Helios.app
 else
-    open build/Helios.app
+    open build.noindex/Helios.app
 fi

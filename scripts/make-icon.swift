@@ -1,5 +1,6 @@
-// Renders the Helios app icon — a total solar eclipse with a terminal prompt in the moon —
-// to a 1024px PNG.  Usage: swift scripts/make-icon.swift <output.png>
+// Renders the Helios app icon to a 1024px PNG: two terminal panes (local and remote) joined by
+// a glowing bridge with a sun at its center, forming an "H".
+// Usage: swift scripts/make-icon.swift <output.png>
 import AppKit
 
 let size: CGFloat = 1024
@@ -9,126 +10,97 @@ func color(_ hex: UInt32, _ alpha: CGFloat = 1) -> NSColor {
     NSColor(srgbRed: CGFloat((hex >> 16) & 0xff) / 255, green: CGFloat((hex >> 8) & 0xff) / 255,
             blue: CGFloat(hex & 0xff) / 255, alpha: alpha)
 }
-
-/// Deterministic pseudo-random numbers so the icon renders identically every build.
-var seed: UInt64 = 0x5EED_4E11_05
-func rand() -> CGFloat {
-    seed = seed &* 6364136223846793005 &+ 1442695040888963407
-    return CGFloat((seed >> 33) % 10_000) / 10_000
+func gradient(_ colors: [NSColor], _ locations: [CGFloat]) -> NSGradient {
+    NSGradient(colors: colors, atLocations: locations, colorSpace: .sRGB)!
+}
+func rounded(_ rect: CGRect, _ radius: CGFloat) -> NSBezierPath {
+    NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
 }
 
 let image = NSImage(size: NSSize(width: size, height: size), flipped: false) { _ in
     guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
 
     // macOS icon grid: ~824px body centered in the 1024 canvas.
-    let inset: CGFloat = 100
-    let body = CGRect(x: inset, y: inset, width: size - 2 * inset, height: size - 2 * inset)
-    let squircle = NSBezierPath(roundedRect: body, xRadius: 185, yRadius: 185)
+    let body = CGRect(x: 100, y: 100, width: 824, height: 824)
+    let squircle = rounded(body, 185)
 
     ctx.saveGState()
     ctx.setShadow(offset: CGSize(width: 0, height: -16), blur: 44, color: NSColor.black.withAlphaComponent(0.5).cgColor)
-    color(0x0c0c0c).setFill()
+    color(0x121212).setFill()
     squircle.fill()
     ctx.restoreGState()
 
     ctx.saveGState()
     squircle.addClip()
 
-    // Deep space: near-black with a faint warm lift toward the center.
-    NSGradient(colors: [color(0x1e1a17), color(0x0d0d0d), color(0x060606)],
-               atLocations: [0, 0.55, 1], colorSpace: .sRGB)!
-        .draw(fromCenter: CGPoint(x: size / 2, y: size / 2), radius: 0,
-              toCenter: CGPoint(x: size / 2, y: size / 2), radius: 520, options: [.drawsAfterEndingLocation])
+    // Charcoal from the Ghostty theme, lit from above, with a warm bloom behind the bridge.
+    gradient([color(0x363636), color(0x1f1f1f), color(0x101010)], [0, 0.5, 1]).draw(in: body, angle: -90)
+    let center = CGPoint(x: 512, y: 512)
+    gradient([color(0xff8700, 0.42), color(0xff8700, 0.12), color(0xff8700, 0)], [0, 0.45, 1])
+        .draw(fromCenter: center, radius: 0, toCenter: center, radius: 420, options: [])
 
-    // Starfield.
-    for _ in 0..<70 {
-        let p = CGPoint(x: inset + rand() * body.width, y: inset + rand() * body.height)
-        let dist = hypot(p.x - size / 2, p.y - size / 2)
-        guard dist > 300 else { continue }
-        let r = 0.8 + rand() * 2.2
-        color(0xffffff, 0.15 + rand() * 0.45).setFill()
-        NSBezierPath(ovalIn: CGRect(x: p.x - r, y: p.y - r, width: 2 * r, height: 2 * r)).fill()
-    }
-
-    let center = CGPoint(x: size / 2, y: size / 2)
-    let moonR: CGFloat = 196
-
-    // Wide outer glow.
-    NSGradient(colors: [color(0xff8700, 0.0), color(0xff8700, 0.35), color(0xff5f00, 0.12), color(0xff5f00, 0)],
-               atLocations: [0, 0.42, 0.7, 1], colorSpace: .sRGB)!
-        .draw(fromCenter: center, radius: 0, toCenter: center, radius: 470, options: [])
-
-    // Corona streamers: tapered wedges of varying length, additive-looking.
-    ctx.setBlendMode(.screen)
-    for i in 0..<36 {
-        let base = CGFloat(i) / 36 * 2 * .pi + (rand() - 0.5) * 0.12
-        let length = moonR + 60 + rand() * (i % 3 == 0 ? 230 : 120)
-        let width = 0.035 + rand() * 0.05
-        let wedge = NSBezierPath()
-        wedge.move(to: CGPoint(x: center.x + cos(base - width) * moonR, y: center.y + sin(base - width) * moonR))
-        wedge.line(to: CGPoint(x: center.x + cos(base) * length, y: center.y + sin(base) * length))
-        wedge.line(to: CGPoint(x: center.x + cos(base + width) * moonR, y: center.y + sin(base + width) * moonR))
-        wedge.close()
+    // The two panes: glassy pillars with a screen inset, a prompt, and a few lines of "output".
+    for x in [222.0, 634.0] as [CGFloat] {
+        let pillar = CGRect(x: x, y: 214, width: 168, height: 596)
         ctx.saveGState()
-        wedge.addClip()
-        NSGradient(colors: [color(0xffe0b0, 0.55), color(0xffaf5f, 0.25), color(0xff8700, 0)],
-                   atLocations: [0, 0.35, 1], colorSpace: .sRGB)!
-            .draw(fromCenter: center, radius: moonR, toCenter: center, radius: length, options: [])
+        ctx.setShadow(offset: CGSize(width: 0, height: -10), blur: 30, color: NSColor.black.withAlphaComponent(0.55).cgColor)
+        let shape = rounded(pillar, 52)
+        gradient([color(0x575757), color(0x2e2e2e), color(0x232323)], [0, 0.55, 1]).draw(in: shape, angle: -90)
         ctx.restoreGState()
+
+        // Top-edge highlight and hairline border.
+        ctx.saveGState()
+        rounded(pillar, 52).addClip()
+        gradient([color(0xffffff, 0.16), color(0xffffff, 0)], [0, 1])
+            .draw(in: CGRect(x: pillar.minX, y: pillar.maxY - 120, width: pillar.width, height: 120), angle: -90)
+        ctx.restoreGState()
+        color(0xffffff, 0.14).setStroke()
+        let border = rounded(pillar.insetBy(dx: 1.5, dy: 1.5), 50)
+        border.lineWidth = 3
+        border.stroke()
+
+        // Screen inset.
+        let screen = rounded(pillar.insetBy(dx: 22, dy: 22), 34)
+        color(0x161616, 0.85).setFill()
+        screen.fill()
+
+        // Prompt ">" in the theme's blue, with a soft glow.
+        ctx.saveGState()
+        ctx.setShadow(offset: .zero, blur: 14, color: color(0x87afd7, 0.8).cgColor)
+        let prompt = NSBezierPath()
+        prompt.lineWidth = 17
+        prompt.lineCapStyle = .round
+        prompt.lineJoinStyle = .round
+        prompt.move(to: CGPoint(x: x + 50, y: 742))
+        prompt.line(to: CGPoint(x: x + 84, y: 718))
+        prompt.line(to: CGPoint(x: x + 50, y: 694))
+        color(0x87afd7).setStroke()
+        prompt.stroke()
+        ctx.restoreGState()
+
+        // Output lines below the bridge.
+        for (i, width) in [86.0, 58.0, 74.0].enumerated() {
+            let line = rounded(CGRect(x: x + 48, y: 372 - CGFloat(i) * 44, width: CGFloat(width), height: 14), 7)
+            color(0xbcbcbc, 0.32).setFill()
+            line.fill()
+        }
     }
 
-    // Inner corona ring hugging the moon's edge.
-    NSGradient(colors: [color(0xffffff, 0.95), color(0xffd787, 0.85), color(0xffaf5f, 0.45), color(0xff8700, 0)],
-               atLocations: [0, 0.18, 0.45, 1], colorSpace: .sRGB)!
-        .draw(fromCenter: center, radius: moonR - 2, toCenter: center, radius: moonR + 95, options: [])
-    ctx.setBlendMode(.normal)
-
-    // The moon.
-    let moon = NSBezierPath(ovalIn: CGRect(x: center.x - moonR, y: center.y - moonR, width: 2 * moonR, height: 2 * moonR))
-    NSGradient(colors: [color(0x1c1c1c), color(0x0a0a0a)], atLocations: [0, 1], colorSpace: .sRGB)!
-        .draw(in: moon, angle: -55)
-    color(0xffd787, 0.35).setStroke()
-    moon.lineWidth = 2
-    moon.stroke()
-
-    // ">_" glowing faintly inside the moon.
+    // The bridge between the panes (the SSH link), glowing.
     ctx.saveGState()
-    ctx.setShadow(offset: .zero, blur: 22, color: color(0xff8700, 0.9).cgColor)
-    let prompt = NSBezierPath()
-    prompt.lineWidth = 24
-    prompt.lineCapStyle = .round
-    prompt.lineJoinStyle = .round
-    prompt.move(to: CGPoint(x: center.x - 78, y: center.y + 48))
-    prompt.line(to: CGPoint(x: center.x - 16, y: center.y))
-    prompt.line(to: CGPoint(x: center.x - 78, y: center.y - 48))
-    prompt.move(to: CGPoint(x: center.x + 14, y: center.y - 54))
-    prompt.line(to: CGPoint(x: center.x + 86, y: center.y - 54))
-    color(0xffaf5f).setStroke()
-    prompt.stroke()
+    ctx.setShadow(offset: .zero, blur: 46, color: color(0xff8700, 0.95).cgColor)
+    let bridge = rounded(CGRect(x: 372, y: 480, width: 280, height: 64), 32)
+    gradient([color(0xff8700), color(0xffaf5f), color(0xffd787), color(0xffaf5f), color(0xff8700)],
+             [0, 0.25, 0.5, 0.75, 1]).draw(in: bridge, angle: 0)
     ctx.restoreGState()
 
-    // Diamond ring: a bright bead of sunlight on the upper-right rim, with a star glare.
-    ctx.setBlendMode(.screen)
-    let angle: CGFloat = .pi / 4
-    let bead = CGPoint(x: center.x + cos(angle) * (moonR + 4), y: center.y + sin(angle) * (moonR + 4))
-    NSGradient(colors: [color(0xffffff, 1), color(0xfff1d6, 0.8), color(0xffaf5f, 0.25), color(0xffaf5f, 0)],
-               atLocations: [0, 0.12, 0.4, 1], colorSpace: .sRGB)!
-        .draw(fromCenter: bead, radius: 0, toCenter: bead, radius: 120, options: [])
-    for (len, thick, rot) in [(150.0, 4.0, 0.0), (150.0, 4.0, CGFloat.pi / 2), (80.0, 2.5, CGFloat.pi / 4), (80.0, 2.5, -CGFloat.pi / 4)] {
-        let spike = NSBezierPath()
-        let dx = cos(rot) * CGFloat(len), dy = sin(rot) * CGFloat(len)
-        spike.move(to: CGPoint(x: bead.x - dx, y: bead.y - dy))
-        spike.line(to: CGPoint(x: bead.x, y: bead.y + CGFloat(thick)))
-        spike.line(to: CGPoint(x: bead.x + dx, y: bead.y + dy))
-        spike.line(to: CGPoint(x: bead.x, y: bead.y - CGFloat(thick)))
-        spike.close()
-        color(0xffffff, 0.75).setFill()
-        spike.fill()
-    }
-    let core = CGRect(x: bead.x - 14, y: bead.y - 14, width: 28, height: 28)
-    color(0xffffff).setFill()
-    NSBezierPath(ovalIn: core).fill()
-    ctx.setBlendMode(.normal)
+    // The sun at the center of the bridge.
+    ctx.saveGState()
+    ctx.setShadow(offset: .zero, blur: 60, color: color(0xffd787).cgColor)
+    let sun = NSBezierPath(ovalIn: CGRect(x: center.x - 62, y: center.y - 62, width: 124, height: 124))
+    gradient([color(0xffffff), color(0xfff1c7), color(0xffd787)], [0, 0.45, 1])
+        .draw(in: sun, relativeCenterPosition: NSPoint(x: -0.25, y: 0.3))
+    ctx.restoreGState()
 
     ctx.restoreGState()
 

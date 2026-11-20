@@ -61,10 +61,6 @@ enum LocalTmux {
     static let path: String? = ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"]
         .first { FileManager.default.isExecutableFile(atPath: $0) }
 
-    static func sessionName(for context: WorkContext) -> String {
-        "helios-local-" + context.id.uuidString.prefix(8).lowercased()
-    }
-
     /// Runs a short tmux command synchronously; returns its exit status.
     @discardableResult
     static func run(_ args: [String]) -> Int32 {
@@ -89,8 +85,13 @@ enum LocalTmux {
         return process.terminationStatus
     }
 
+    /// Kills every local tmux session belonging to a context (all its local sub-tabs).
     static func kill(_ context: WorkContext) {
-        run(["kill-session", "-t", "=" + sessionName(for: context)])
+        context.localTabs.forEach { kill(session: context.localTmuxSession(for: $0)) }
+    }
+
+    static func kill(session name: String) {
+        run(["kill-session", "-t", "=" + name])
     }
 }
 
@@ -117,28 +118,33 @@ enum ClaudeHistory {
     }
 }
 
-/// The left panel: a login shell in the context's directory that runs the startup command.
-/// Lives in a local tmux session when tmux is installed, so it outlives the app.
+/// A local sub-tab: a login shell in the context's directory. The primary tab also runs the
+/// startup command (Claude). Lives in a local tmux session when tmux is installed, so it
+/// outlives the app.
 @MainActor
 final class LocalSession: NSObject, ObservableObject, @preconcurrency LocalProcessTerminalViewDelegate {
     let terminal = makeTerminalView()
     @Published private(set) var isRunning = false
     private let context: WorkContext
+    let tab: PaneTab
 
-    init(context: WorkContext) {
+    init(context: WorkContext, tab: PaneTab) {
         self.context = context
+        self.tab = tab
         super.init()
         terminal.processDelegate = self
         start()
     }
 
+    private var isPrimary: Bool { tab.id == context.localTabs.first?.id }
+
     func start() {
         let dir = expandTilde(context.localDir.isEmpty ? "~" : context.localDir)
-        let cmd = ClaudeHistory.startupCommand(for: context)
+        let cmd = isPrimary ? ClaudeHistory.startupCommand(for: context) : ""
         isRunning = true
 
         if let tmux = LocalTmux.path {
-            let name = LocalTmux.sessionName(for: context)
+            let name = context.localTmuxSession(for: tab)
             // Only a new session runs the startup command; an existing one (from before an
             // app restart) is just reattached. The command is run by an interactive login shell
             // rather than typed in, since zsh startup can discard early keystrokes. When it
@@ -198,7 +204,7 @@ final class SSHSession: NSObject, ObservableObject, @preconcurrency LocalProcess
     let terminal = makeTerminalView()
     @Published private(set) var state: State = .running
     private let context: WorkContext
-    let tab: RemoteTab
+    let tab: PaneTab
     private var attempt = 0
     private var startedAt = Date()
     private var retryTask: Task<Void, Never>?
@@ -210,7 +216,7 @@ final class SSHSession: NSObject, ObservableObject, @preconcurrency LocalProcess
     /// A session that stayed up this long counts as healthy and resets the backoff.
     private static let healthyDuration: TimeInterval = 30
 
-    init(context: WorkContext, tab: RemoteTab) {
+    init(context: WorkContext, tab: PaneTab) {
         self.context = context
         self.tab = tab
         super.init()
@@ -294,7 +300,8 @@ final class SSHSession: NSObject, ObservableObject, @preconcurrency LocalProcess
 /// Live terminals and monitors for one context. Kept alive across tab switches so sessions keep running.
 @MainActor
 final class ContextRuntime: ObservableObject {
-    let local: LocalSession
+    @Published private(set) var localSessions: [UUID: LocalSession] = [:]
+    @Published var selectedLocalTab: UUID?
     @Published private(set) var remoteSessions: [UUID: SSHSession] = [:]
     @Published var selectedRemoteTab: UUID?
     let git: GitMonitor
@@ -322,7 +329,6 @@ final class ContextRuntime: ObservableObject {
 
     init(context: WorkContext) {
         self.context = context
-        local = LocalSession(context: context)
         git = GitMonitor(directory: context.localDir)
         jobs = context.hasHost ? JobsMonitor(host: context.host) : nil
         files = context.hasHost ? FileBrowser(host: context.host, startDir: context.remoteDir, localDir: context.localDir) : nil
@@ -330,11 +336,53 @@ final class ContextRuntime: ObservableObject {
         if context.hasHost, let first = context.remoteTabs.first {
             remoteSessions[first.id] = makeSSHSession(first)
         }
-        local.terminal.onBell = { [weak self] in self?.onAttention?(.bell) }
-        local.terminal.onOutput = { [weak self] in self?.noteLocalOutput() }
+        selectedLocalTab = context.localTabs.first?.id
+        if let first = context.localTabs.first {
+            localSessions[first.id] = makeLocalSession(first)
+        }
     }
 
-    private func makeSSHSession(_ tab: RemoteTab) -> SSHSession {
+    private func makeLocalSession(_ tab: PaneTab) -> LocalSession {
+        let session = LocalSession(context: context, tab: tab)
+        session.terminal.onBell = { [weak self] in self?.onAttention?(.bell) }
+        // "Went quiet" is only meaningful for the primary tab, where Claude runs.
+        if tab.id == context.localTabs.first?.id {
+            session.terminal.onOutput = { [weak self] in self?.noteLocalOutput() }
+        }
+        return session
+    }
+
+    /// The primary local session (Claude).
+    var primaryLocal: LocalSession? {
+        context.localTabs.first.flatMap { localSessions[$0.id] }
+    }
+
+    /// The local sub-tab currently shown.
+    var visibleLocal: LocalSession? {
+        (selectedLocalTab ?? context.localTabs.first?.id).flatMap { localSessions[$0] }
+    }
+
+    /// The SSH sub-tab currently shown.
+    var visibleSSH: SSHSession? {
+        (selectedRemoteTab ?? context.remoteTabs.first?.id).flatMap { remoteSessions[$0] }
+    }
+
+    /// Local session for a sub-tab, starting it the first time it is shown.
+    func localSession(for tab: PaneTab) -> LocalSession {
+        if let existing = localSessions[tab.id] { return existing }
+        let session = makeLocalSession(tab)
+        localSessions[tab.id] = session
+        return session
+    }
+
+    /// Which pane a terminal view belongs to, if any.
+    func side(of view: NSView) -> PaneSide? {
+        if localSessions.values.contains(where: { $0.terminal === view }) { return .local }
+        if remoteSessions.values.contains(where: { $0.terminal === view }) { return .remote }
+        return nil
+    }
+
+    private func makeSSHSession(_ tab: PaneTab) -> SSHSession {
         let session = SSHSession(context: context, tab: tab)
         session.terminal.onBell = { [weak self] in self?.onAttention?(.bell) }
         return session
@@ -365,7 +413,7 @@ final class ContextRuntime: ObservableObject {
     }
 
     /// Session for a sub-tab, connecting lazily the first time it is shown.
-    func session(for tab: RemoteTab) -> SSHSession? {
+    func session(for tab: PaneTab) -> SSHSession? {
         guard context.hasHost else { return nil }
         if let existing = remoteSessions[tab.id] { return existing }
         let session = makeSSHSession(tab)
@@ -384,6 +432,14 @@ final class ContextRuntime: ObservableObject {
         if let selected = selectedRemoteTab, !live.contains(selected) {
             selectedRemoteTab = context.remoteTabs.first?.id
         }
+        let liveLocal = Set(context.localTabs.map(\.id))
+        for (id, session) in localSessions where !liveLocal.contains(id) {
+            session.stop()
+            localSessions[id] = nil
+        }
+        if let selected = selectedLocalTab, !liveLocal.contains(selected) {
+            selectedLocalTab = context.localTabs.first?.id
+        }
     }
 
     /// Polling only runs for the context on screen.
@@ -395,7 +451,7 @@ final class ContextRuntime: ObservableObject {
     func shutdown() {
         setActive(false)
         quietWatch?.cancel()
-        local.stop()
+        localSessions.values.forEach { $0.stop() }
         remoteSessions.values.forEach { $0.stop() }
     }
 }

@@ -22,8 +22,14 @@ final class AppModel: ObservableObject {
     /// Background contexts that want attention (bell, or Claude went quiet).
     @Published private(set) var attention: [UUID: ContextRuntime.Attention] = [:]
     @Published var isPaletteOpen = false
-    /// SSH sub-tab awaiting close confirmation (closing kills its remote tmux session).
-    @Published var closingRemoteTab: RemoteTab?
+    /// Sub-tab awaiting close confirmation (closing kills its tmux session).
+    @Published var closingTab: ClosingTab?
+
+    struct ClosingTab: Identifiable {
+        let tab: PaneTab
+        let side: PaneSide
+        var id: UUID { tab.id }
+    }
     /// Context being edited in the sheet; `isNewContext` distinguishes add from edit.
     @Published var editing: WorkContext?
     @Published var isNewContext = false
@@ -169,18 +175,11 @@ final class AppModel: ObservableObject {
         focusPane(remote: false)
     }
 
-    /// Moves keyboard focus to the local (left) or SSH (right) terminal of the selected context.
+    /// Moves keyboard focus to the visible local (left) or SSH (right) terminal.
     func focusPane(remote: Bool) {
         guard let selected, let runtime = runtimes[selected.id] else { return }
-        let target: NSView
-        if remote {
-            guard let id = runtime.selectedRemoteTab ?? selected.remoteTabs.first?.id,
-                  let session = runtime.remoteSessions[id] else { return }
-            target = session.terminal
-        } else {
-            target = runtime.local.terminal
-        }
-        FocusTracker.shared.request(target)
+        let target: NSView? = remote ? runtime.visibleSSH?.terminal : runtime.visibleLocal?.terminal
+        if let target { FocusTracker.shared.request(target) }
     }
 
     func toggleDrawer(_ tab: DrawerTab? = nil) {
@@ -188,60 +187,91 @@ final class AppModel: ObservableObject {
         withAnimation(.snappy(duration: 0.28)) { drawerTab = drawerTab == target ? nil : target }
     }
 
-    // MARK: SSH sub-tabs
+    // MARK: Sub-tabs (local and SSH)
 
-    func addRemoteTab() {
-        guard let context = selected, context.hasHost else { return }
-        let tab = RemoteTab(name: "shell \(context.remoteTabs.count + 1)")
-        update(context.id) { $0.remoteTabs.append(tab) }
-        if let runtime = runtimes[context.id], let session = runtime.session(for: tab) {
+    /// The pane holding keyboard focus; tab shortcuts act on it. Defaults to local.
+    func focusedSide() -> PaneSide {
+        guard let selected, let runtime = runtimes[selected.id],
+              let focused = FocusTracker.shared.focusedView else { return .local }
+        return runtime.side(of: focused) ?? .local
+    }
+
+    private func selectTab(_ tab: PaneTab, side: PaneSide, in runtime: ContextRuntime) {
+        switch side {
+        case .local:
+            runtime.selectedLocalTab = tab.id
+            FocusTracker.shared.request(runtime.localSession(for: tab).terminal)
+        case .remote:
             runtime.selectedRemoteTab = tab.id
-            // Type into the new tab right away, without clicking it.
-            FocusTracker.shared.request(session.terminal)
+            if let session = runtime.session(for: tab) { FocusTracker.shared.request(session.terminal) }
         }
     }
 
-    /// Asks to close a sub-tab. The primary (first) tab is never closable.
-    func requestCloseRemoteTab(_ tab: RemoteTab) {
-        guard let context = selected, tab.id != context.remoteTabs.first?.id else { return }
-        closingRemoteTab = tab
+    /// ⇧⌘T: new sub-tab in the focused pane, focused and ready to type.
+    func addTab(_ side: PaneSide? = nil) {
+        guard let context = selected, let runtime = runtimes[context.id] else { return }
+        var side = side ?? focusedSide()
+        if side == .remote && !context.hasHost { side = .local }
+        let tab = PaneTab(name: "shell \(context.tabs(side).count + 1)")
+        update(context.id) { $0.setTabs(side, $0.tabs(side) + [tab]) }
+        selectTab(tab, side: side, in: runtime)
     }
 
-    /// ⌘W: asks to close the SSH sub-tab currently shown; no-op on the primary tab.
-    func requestCloseCurrentRemoteTab() {
-        guard let context = selected, let runtime = runtimes[context.id],
-              let id = runtime.selectedRemoteTab,
-              let tab = context.remoteTabs.first(where: { $0.id == id }) else { return }
-        requestCloseRemoteTab(tab)
+    /// ⇧⌘← / ⇧⌘→: previous/next sub-tab in the focused pane (wraps).
+    func selectAdjacentTab(_ offset: Int, side: PaneSide? = nil) {
+        guard let context = selected, let runtime = runtimes[context.id] else { return }
+        let side = side ?? focusedSide()
+        let tabs = context.tabs(side)
+        let currentID = side == .local ? runtime.selectedLocalTab : runtime.selectedRemoteTab
+        let current = tabs.firstIndex { $0.id == currentID } ?? 0
+        guard !tabs.isEmpty else { return }
+        selectTab(tabs[(current + offset + tabs.count) % tabs.count], side: side, in: runtime)
     }
 
-    /// Closes a sub-tab and kills its remote tmux session. The primary tab can't be closed.
-    func closeRemoteTab(_ tab: RemoteTab) {
-        closingRemoteTab = nil
-        guard let context = selected, tab.id != context.remoteTabs.first?.id else { return }
-        let session = context.tmuxSession(for: tab)
-        let host = context.host
-        update(context.id) { $0.remoteTabs.removeAll { $0.id == tab.id } }
-        Task.detached { _ = await Shell.remote(host, "tmux kill-session -t \(session) 2>/dev/null", timeout: 15) }
-        // Land back in the primary SSH tab, ready to type.
-        focusPane(remote: true)
+    func selectTab(_ tab: PaneTab, side: PaneSide) {
+        guard let context = selected, let runtime = runtimes[context.id] else { return }
+        withAnimation(.snappy(duration: 0.2)) { selectTab(tab, side: side, in: runtime) }
     }
 
-    /// ⇧⌘← / ⇧⌘→: previous/next SSH sub-tab (wraps), focusing its shell.
-    func selectAdjacentRemoteTab(_ offset: Int) {
-        guard let context = selected, context.hasHost, let runtime = runtimes[context.id] else { return }
-        let tabs = context.remoteTabs
-        guard tabs.count > 1 else { focusPane(remote: true); return }
-        let current = tabs.firstIndex { $0.id == runtime.selectedRemoteTab } ?? 0
-        let next = tabs[(current + offset + tabs.count) % tabs.count]
-        runtime.selectedRemoteTab = next.id
-        if let session = runtime.session(for: next) { FocusTracker.shared.request(session.terminal) }
+    /// Asks to close a sub-tab. The primary (first) tab of each pane is never closable.
+    func requestCloseTab(_ tab: PaneTab, side: PaneSide) {
+        guard let context = selected, tab.id != context.tabs(side).first?.id else { return }
+        closingTab = ClosingTab(tab: tab, side: side)
     }
 
-    func renameRemoteTab(_ tab: RemoteTab, to name: String) {
+    /// ⌘W: asks to close the sub-tab shown in the focused pane; no-op on a primary tab.
+    func requestCloseCurrentTab() {
+        guard let context = selected, let runtime = runtimes[context.id] else { return }
+        let side = focusedSide()
+        let id = side == .local ? runtime.selectedLocalTab : runtime.selectedRemoteTab
+        guard let tab = context.tabs(side).first(where: { $0.id == id }) else { return }
+        requestCloseTab(tab, side: side)
+    }
+
+    /// Closes a sub-tab and kills its tmux session, then focuses that pane's primary tab.
+    func closeTab(_ tab: PaneTab, side: PaneSide) {
+        closingTab = nil
+        guard let context = selected, tab.id != context.tabs(side).first?.id else { return }
+        switch side {
+        case .local:
+            let session = context.localTmuxSession(for: tab)
+            update(context.id) { $0.localTabs.removeAll { $0.id == tab.id } }
+            LocalTmux.kill(session: session)
+        case .remote:
+            let session = context.tmuxSession(for: tab)
+            let host = context.host
+            update(context.id) { $0.remoteTabs.removeAll { $0.id == tab.id } }
+            Task.detached { _ = await Shell.remote(host, "tmux kill-session -t \(session) 2>/dev/null", timeout: 15) }
+        }
+        focusPane(remote: side == .remote)
+    }
+
+    func renameTab(_ tab: PaneTab, side: PaneSide, to name: String) {
         guard let context = selected else { return }
         update(context.id) { ctx in
-            if let i = ctx.remoteTabs.firstIndex(where: { $0.id == tab.id }) { ctx.remoteTabs[i].name = name }
+            var tabs = ctx.tabs(side)
+            if let i = tabs.firstIndex(where: { $0.id == tab.id }) { tabs[i].name = name }
+            ctx.setTabs(side, tabs)
         }
     }
 }
@@ -308,9 +338,9 @@ struct HeliosApp: App {
         }
         .windowStyle(.hiddenTitleBar)
         .commands {
-            // ⌘W closes the current SSH sub-tab instead of the window (which would quit Helios).
+            // ⌘W closes the focused pane's sub-tab instead of the window (which would quit Helios).
             CommandGroup(replacing: .saveItem) {
-                Button("Close SSH Tab") { model.requestCloseCurrentRemoteTab() }
+                Button("Close Tab") { model.requestCloseCurrentTab() }
                     .keyboardShortcut("w", modifiers: .command)
             }
             CommandGroup(replacing: .newItem) {
@@ -321,11 +351,12 @@ struct HeliosApp: App {
                 Button("Restart Context Terminals") { model.restartSelected() }
                     .keyboardShortcut("r", modifiers: [.command, .shift])
                 Divider()
-                Button("New SSH Tab") { model.addRemoteTab() }
+                // Tab shortcuts act on whichever pane (local or SSH) has keyboard focus.
+                Button("New Tab in Pane") { model.addTab() }
                     .keyboardShortcut("t", modifiers: [.command, .shift])
-                Button("Next SSH Tab") { model.selectAdjacentRemoteTab(1) }
+                Button("Next Tab in Pane") { model.selectAdjacentTab(1) }
                     .keyboardShortcut(.rightArrow, modifiers: [.command, .shift])
-                Button("Previous SSH Tab") { model.selectAdjacentRemoteTab(-1) }
+                Button("Previous Tab in Pane") { model.selectAdjacentTab(-1) }
                     .keyboardShortcut(.leftArrow, modifiers: [.command, .shift])
             }
             CommandMenu("Go") {

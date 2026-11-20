@@ -6,7 +6,7 @@ One window, many research contexts. Each tab pairs a **local terminal** (usually
 
 ```sh
 swift run                         # dev
-./scripts/build-app.sh            # -> build/Helios.app
+./scripts/build-app.sh            # -> build.noindex/Helios.app
 ./scripts/build-app.sh --install  # also installs to /Applications (Spotlight, Launchpad, Dock)
 ./scripts/relaunch.sh            # quit Helios, wait for it to exit, reopen (installed copy if present)
 ```
@@ -26,9 +26,9 @@ Contexts are listed in the left sidebar; the strip at the top of each one shows 
 | ⇧⌘R | Restart current context's terminals |
 | ⌘1…⌘9 | Jump to context |
 | ⇧⌘[ / ⇧⌘] | Previous / next context |
-| ⇧⌘T | New SSH sub-tab |
-| ⇧⌘← / ⇧⌘→ | Previous / next SSH sub-tab |
-| ⌘W | Close current SSH sub-tab (asks first; the main tab can't be closed) |
+| ⇧⌘T | New sub-tab in the focused pane (local or SSH) |
+| ⇧⌘← / ⇧⌘→ | Previous / next sub-tab in the focused pane |
+| ⌘W | Close the focused pane's sub-tab (asks first; a pane's first tab can't be closed) |
 | ⌘I | Toggle drawer |
 | ⌘K | Command palette |
 | ⌘[ / ⌘] | Focus local / SSH pane |
@@ -60,7 +60,7 @@ The info strip at the top of a context shows chips for the local dir, git branch
 
 Background remote commands only run over an already-authenticated shared connection (checked locally with `ssh -O check`, then `BatchMode=yes`), so they never open new logins, prompt for 2FA, or risk failed-login lockouts. Until the SSH pane is authenticated, panels show "Not connected".
 
-**SSH sub-tabs** sit above the right pane; each is its own tmux session (`helios-<id>-<tab>`) over the shared connection. Closing one kills its tmux session; the first tab can't be closed.
+**Local sub-tabs** sit above the left pane: the first runs the startup command (Claude), extra ones are plain shells in the project dir, each its own local tmux session. **SSH sub-tabs** sit above the right pane; each is its own tmux session (`helios-<id>-<tab>`) over the shared connection. Closing one kills its tmux session; the first tab can't be closed.
 
 The local/remote split and the drawer height are draggable and remembered.
 

@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
-# Builds Helios.app into ./build. Pass --install to copy it into /Applications.
+# Builds Helios.app into ./build.noindex (".noindex" keeps Spotlight from listing a second copy). Pass --install to copy it into /Applications.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 swift build -c release
 BIN="$(swift build -c release --show-bin-path)/Helios"
-APP="build/Helios.app"
+APP="build.noindex/Helios.app"
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/Helios"
 
 # App icon: render once, then build every size macOS wants into an .icns.
-ICON_PNG="build/icon-1024.png"
+ICON_PNG="build.noindex/icon-1024.png"
 if [[ ! -f "$ICON_PNG" || scripts/make-icon.swift -nt "$ICON_PNG" ]]; then
     swift scripts/make-icon.swift "$ICON_PNG" >/dev/null
 fi
-ICONSET="build/AppIcon.iconset"
+ICONSET="build.noindex/AppIcon.iconset"
 rm -rf "$ICONSET" && mkdir -p "$ICONSET"
 for px in 16 32 128 256 512; do
     sips -z $px $px "$ICON_PNG" --out "$ICONSET/icon_${px}x${px}.png" >/dev/null

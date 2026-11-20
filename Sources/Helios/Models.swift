@@ -1,9 +1,13 @@
 import Foundation
 
-/// One SSH sub-tab in a context's right pane; each maps to its own remote tmux session.
-struct RemoteTab: Codable, Identifiable, Equatable {
+/// One sub-tab in a context's local (left) or SSH (right) pane; each maps to its own tmux session.
+struct PaneTab: Codable, Identifiable, Equatable {
     var id = UUID()
     var name: String
+}
+
+enum PaneSide {
+    case local, remote
 }
 
 /// A research context: one tab pairing a local terminal with a remote SSH session.
@@ -25,7 +29,9 @@ struct WorkContext: Codable, Identifiable, Equatable {
     /// Fraction of the width given to the local (left) pane.
     var splitRatio: Double = 0.5
     /// SSH sub-tabs; the first one is the primary session.
-    var remoteTabs: [RemoteTab] = [RemoteTab(name: "main")]
+    var remoteTabs: [PaneTab] = [PaneTab(name: "main")]
+    /// Local sub-tabs; the first runs the startup command (Claude), the rest are plain shells.
+    var localTabs: [PaneTab] = [PaneTab(name: "claude")]
 
     init(name: String, localDir: String) {
         self.name = name
@@ -44,13 +50,33 @@ struct WorkContext: Codable, Identifiable, Equatable {
         remoteDir = try c.decodeIfPresent(String.self, forKey: .remoteDir) ?? ""
         notes = try c.decodeIfPresent(String.self, forKey: .notes) ?? ""
         splitRatio = try c.decodeIfPresent(Double.self, forKey: .splitRatio) ?? 0.5
-        remoteTabs = try c.decodeIfPresent([RemoteTab].self, forKey: .remoteTabs) ?? [RemoteTab(name: "main")]
-        if remoteTabs.isEmpty { remoteTabs = [RemoteTab(name: "main")] }
+        remoteTabs = try c.decodeIfPresent([PaneTab].self, forKey: .remoteTabs) ?? [PaneTab(name: "main")]
+        if remoteTabs.isEmpty { remoteTabs = [PaneTab(name: "main")] }
+        localTabs = try c.decodeIfPresent([PaneTab].self, forKey: .localTabs) ?? []
+        if localTabs.isEmpty {
+            let first = startupCommand.split(separator: " ").first.map(String.init) ?? ""
+            localTabs = [PaneTab(name: first.isEmpty ? "main" : first)]
+        }
+    }
+
+    func tabs(_ side: PaneSide) -> [PaneTab] {
+        side == .local ? localTabs : remoteTabs
+    }
+
+    mutating func setTabs(_ side: PaneSide, _ tabs: [PaneTab]) {
+        if side == .local { localTabs = tabs } else { remoteTabs = tabs }
+    }
+
+    /// Local tmux session for a sub-tab. The primary keeps the original `helios-local-<id>` name
+    /// so sessions from before sub-tabs existed are reattached.
+    func localTmuxSession(for tab: PaneTab) -> String {
+        let base = "helios-local-" + id.uuidString.prefix(8).lowercased()
+        return tab.id == localTabs.first?.id ? base : base + "-" + tab.id.uuidString.prefix(4).lowercased()
     }
 
     /// Name of the remote tmux session for a sub-tab; tied to ids so renames don't orphan it.
     /// The primary tab keeps the original `helios-<id>` name.
-    func tmuxSession(for tab: RemoteTab) -> String {
+    func tmuxSession(for tab: PaneTab) -> String {
         let base = "helios-" + id.uuidString.prefix(8).lowercased()
         return tab.id == remoteTabs.first?.id ? base : base + "-" + tab.id.uuidString.prefix(4).lowercased()
     }
