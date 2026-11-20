@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Quits Helios, waits until it has fully exited, then opens the latest build.
+# (Running `open` while the old copy is still quitting silently does nothing.)
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+osascript -e 'tell application id "local.helios" to quit' >/dev/null 2>&1 || true
+for _ in $(seq 1 50); do
+    pgrep -f "Helios.app/Contents/MacOS/Helios" >/dev/null || break
+    sleep 0.1
+done
+open build/Helios.app

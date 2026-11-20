@@ -8,6 +8,7 @@ One window, many research contexts. Each tab pairs a **local terminal** (usually
 swift run                         # dev
 ./scripts/build-app.sh            # -> build/Helios.app
 ./scripts/build-app.sh --install  # also copies to ~/Applications
+./scripts/relaunch.sh            # quit Helios, wait for it to exit, reopen build/Helios.app
 ```
 
 Requires macOS 14+ and the Xcode toolchain. Terminal emulation is [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm), pinned to 1.20.0 (1.99.x doesn't compile with Swift 6.2).
@@ -25,10 +26,13 @@ Contexts are listed in the left sidebar; the strip at the top of each one shows 
 | ⇧⌘R | Restart current context's terminals |
 | ⌘1…⌘9 | Jump to context |
 | ⇧⌘[ / ⇧⌘] | Previous / next context |
-| ⌥⌘T | New SSH sub-tab |
+| ⇧⌘T | New SSH sub-tab |
+| ⇧⌘← / ⇧⌘→ | Previous / next SSH sub-tab |
+| ⌘W | Close current SSH sub-tab (asks first; the main tab can't be closed) |
 | ⌘I | Toggle drawer |
 | ⌥⌘1…⌥⌘4 | Drawer: Jobs / Git / Notes / Files |
 | ⌘K | Command palette |
+| ⌘[ / ⌘] | Focus local / SSH pane |
 
 ## Theme
 

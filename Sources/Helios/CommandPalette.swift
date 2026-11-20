@@ -40,9 +40,23 @@ struct CommandPalette: View {
                 if model.drawerTab != tab { model.toggleDrawer(tab) }
             })
         }
+        items.append(Item(id: "focus-local", title: "Focus local pane", icon: "laptopcomputer", shortcut: "⌘[", keepsFocus: true) {
+            model.focusPane(remote: false)
+        })
         if model.selected?.hasHost == true {
+            items.append(Item(id: "focus-remote", title: "Focus SSH pane", icon: "network", shortcut: "⌘]", keepsFocus: true) {
+                model.focusPane(remote: true)
+            })
             items += [
-                Item(id: "ssh-tab", title: "New SSH tab", icon: "plus.rectangle.on.rectangle", shortcut: "⌥⌘T") { model.addRemoteTab() },
+                Item(id: "ssh-tab", title: "New SSH tab", icon: "plus.rectangle.on.rectangle", shortcut: "⇧⌘T") { model.addRemoteTab() },
+                Item(id: "ssh-tab-next", title: "Next SSH tab", icon: "chevron.right", shortcut: "⇧⌘→", keepsFocus: true) {
+                    model.selectAdjacentRemoteTab(1)
+                },
+                Item(id: "ssh-tab-prev", title: "Previous SSH tab", icon: "chevron.left", shortcut: "⇧⌘←", keepsFocus: true) {
+                    model.selectAdjacentRemoteTab(-1)
+                },
+                Item(id: "ssh-tab-close", title: "Close SSH tab", subtitle: "Not available on the main tab",
+                     icon: "xmark.rectangle", shortcut: "⌘W", keepsFocus: true) { model.requestCloseCurrentRemoteTab() },
                 Item(id: "reconnect", title: "Reconnect SSH", icon: "arrow.triangle.2.circlepath") {
                     if let selected = model.selected, let runtime = model.existingRuntime(for: selected.id),
                        let id = runtime.selectedRemoteTab ?? selected.remoteTabs.first?.id {

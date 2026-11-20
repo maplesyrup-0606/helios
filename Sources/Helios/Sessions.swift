@@ -77,8 +77,15 @@ enum LocalTmux {
         process.environment = env
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
+        // Block on a semaphore rather than waitUntilExit(): that spins the run loop, which can
+        // re-enter SwiftUI mid-update and crash (AttributeGraph precondition failure).
+        let done = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in done.signal() }
         do { try process.run() } catch { return -1 }
-        process.waitUntilExit()
+        if done.wait(timeout: .now() + 5) == .timedOut {
+            process.terminate()
+            return -1
+        }
         return process.terminationStatus
     }
 

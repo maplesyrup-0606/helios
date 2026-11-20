@@ -14,12 +14,20 @@ struct ContentView: View {
             Sidebar()
                 .frame(width: 232)
             Group {
-                if let context = model.selected {
-                    let runtime = model.runtime(for: context)
-                    // Keyed by runtime so a restarted context rebuilds and re-activates its monitors.
-                    ContextDetail(context: context, runtime: runtime)
-                        .id(ObjectIdentifier(runtime))
-                        .transition(.opacity)
+                if model.selected != nil {
+                    ZStack {
+                        ForEach(model.mountedContexts, id: \.context.id) { context, runtime in
+                            let isActive = context.id == model.selectedID
+                            // Keyed by runtime so a restarted context rebuilds its panes.
+                            ContextDetail(context: context, runtime: runtime, isActive: isActive)
+                                .id(ObjectIdentifier(runtime))
+                                .opacity(isActive ? 1 : 0)
+                                .allowsHitTesting(isActive)
+                                .accessibilityHidden(!isActive)
+                        }
+                    }
+                    // Switch instantly; animating would re-lay-out terminals every frame.
+                    .transaction { $0.animation = nil }
                 } else {
                     EmptyState()
                 }
@@ -37,6 +45,17 @@ struct ContentView: View {
         .animation(.snappy(duration: 0.2), value: model.attention)
         .foregroundStyle(theme.text)
         .ignoresSafeArea()
+        .alert(
+            "Close “\(model.closingRemoteTab?.name ?? "")”?",
+            isPresented: Binding(get: { model.closingRemoteTab != nil }, set: { if !$0 { model.closingRemoteTab = nil } }),
+            presenting: model.closingRemoteTab
+        ) { tab in
+            Button("Close Tab", role: .destructive) { model.closeRemoteTab(tab) }
+                .keyboardShortcut(.defaultAction)
+            Button("Cancel", role: .cancel) { model.closingRemoteTab = nil; model.focusPane(remote: true) }
+        } message: { _ in
+            Text("This ends its tmux session on \(model.selected?.host ?? "the host") and anything running in it.")
+        }
         .sheet(item: $model.editing) { context in
             ContextEditor(draft: context, isNew: model.isNewContext)
                 .environmentObject(model)
@@ -284,9 +303,11 @@ private struct ContextDetail: View {
     @AppStorage("drawerRatio") private var drawerRatio = 0.62
     let context: WorkContext
     @ObservedObject var runtime: ContextRuntime
+    /// Only the selected context is visible; others stay mounted but hidden.
+    let isActive: Bool
 
     private var drawerTab: DrawerTab? {
-        guard let tab = model.drawerTab, !tab.needsHost || context.hasHost else { return nil }
+        guard isActive, let tab = model.drawerTab, !tab.needsHost || context.hasHost else { return nil }
         return tab
     }
 
@@ -303,29 +324,37 @@ private struct ContextDetail: View {
             }
             .padding([.horizontal, .bottom], 10)
         }
-        .onAppear { runtime.setActive(true) }
+        .onAppear { activate(isActive) }
+        .onChange(of: isActive) { _, active in activate(active) }
         .onDisappear { runtime.setActive(false) }
+    }
+
+    /// Polling runs only for the visible context; becoming visible puts the cursor in its local pane.
+    private func activate(_ active: Bool) {
+        runtime.setActive(active)
+        if active { FocusTracker.shared.request(runtime.local.terminal) }
     }
 
     private var panes: some View {
         ResizableSplit(axis: .horizontal, ratio: context.splitRatio,
                        onCommit: { ratio in model.update(context.id) { $0.splitRatio = ratio } }) {
-            LocalPane(context: context, session: runtime.local)
+            LocalPane(context: context, session: runtime.local, isActive: isActive)
         } second: {
-            RemotePane(context: context, runtime: runtime)
+            RemotePane(context: context, runtime: runtime, isActive: isActive)
         }
     }
 
     private func sendToSSH(_ text: String) {
         guard let id = runtime.selectedRemoteTab, let session = runtime.remoteSessions[id] else { return }
         session.terminal.send(data: ArraySlice(Array(text.utf8)))
-        session.terminal.window?.makeFirstResponder(session.terminal)
+        FocusTracker.shared.request(session.terminal)
     }
 }
 
 private struct LocalPane: View {
     let context: WorkContext
     @ObservedObject var session: LocalSession
+    let isActive: Bool
     @ObservedObject private var focus = FocusTracker.shared
 
     var body: some View {
@@ -348,7 +377,7 @@ private struct LocalPane: View {
             }
             .padding(.horizontal, 12)
         } content: {
-            TerminalSurface(view: session.terminal, focusOnAppear: true)
+            TerminalSurface(view: session.terminal, isVisible: isActive)
         }
     }
 }
@@ -358,6 +387,7 @@ private struct RemotePane: View {
     @EnvironmentObject private var model: AppModel
     let context: WorkContext
     @ObservedObject var runtime: ContextRuntime
+    let isActive: Bool
     @ObservedObject private var focus = FocusTracker.shared
 
     private var selectedTab: RemoteTab? {
@@ -383,12 +413,25 @@ private struct RemotePane: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-        } else if let tab = selectedTab, let session = runtime.session(for: tab) {
-            Card(isFocused: focus.isFocused(session.terminal)) {
+        } else if let selected = selectedTab {
+            Card(isFocused: runtime.remoteSessions[selected.id].map { focus.isFocused($0.terminal) } ?? false) {
                 RemoteTabStrip(context: context, runtime: runtime)
             } content: {
-                TerminalSurface(view: session.terminal, focusOnAppear: false)
-                    .id(tab.id)
+                // Every opened sub-tab stays mounted; switching only changes which is visible.
+                ZStack {
+                    ForEach(context.remoteTabs) { tab in
+                        if let session = runtime.remoteSessions[tab.id] {
+                            let visible = isActive && tab.id == selected.id
+                            TerminalSurface(view: session.terminal, isVisible: visible)
+                                .opacity(visible ? 1 : 0)
+                                .allowsHitTesting(visible)
+                        }
+                    }
+                }
+                .onAppear {
+                    // A saved sub-tab connects the first time it's shown (outside view updates).
+                    if runtime.remoteSessions[selected.id] == nil { _ = runtime.session(for: selected) }
+                }
             }
         }
     }
@@ -416,12 +459,12 @@ private struct RemoteTabStrip: View {
                             canClose: index > 0,
                             namespace: pill,
                             select: { select(tab) },
-                            close: { model.closeRemoteTab(tab) },
+                            close: { model.requestCloseRemoteTab(tab) },
                             rename: { newName = tab.name; renaming = tab })
                     }
                 }
             }
-            IconButton(systemName: "plus", help: "New SSH tab (⌥⌘T)") { model.addRemoteTab() }
+            IconButton(systemName: "plus", help: "New SSH tab (⇧⌘T)") { model.addRemoteTab() }
         }
         .padding(.horizontal, 6)
         .alert("Rename tab", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
@@ -438,9 +481,7 @@ private struct RemoteTabStrip: View {
 
     private func select(_ tab: RemoteTab) {
         withAnimation(.snappy(duration: 0.2)) { runtime.selectedRemoteTab = tab.id }
-        if let session = runtime.session(for: tab) {
-            DispatchQueue.main.async { session.terminal.window?.makeFirstResponder(session.terminal) }
-        }
+        if let session = runtime.session(for: tab) { FocusTracker.shared.request(session.terminal) }
     }
 }
 
@@ -668,10 +709,10 @@ private struct ChipAction: View {
 /// Inset terminal inside a card.
 private struct TerminalSurface: View {
     let view: NSView
-    let focusOnAppear: Bool
+    let isVisible: Bool
 
     var body: some View {
-        TerminalHost(view: view, focusOnAppear: focusOnAppear)
+        TerminalHost(view: view, isVisible: isVisible)
             .padding(.horizontal, 12)
             .padding(.top, 4)
             .padding(.bottom, 10)
@@ -690,11 +731,33 @@ final class FocusTracker: ObservableObject {
         guard observations[key] == nil else { return }
         observations[key] = window.observe(\.firstResponder, options: [.initial, .new]) { [weak self] window, _ in
             let responder = window.firstResponder.map(ObjectIdentifier.init)
-            MainActor.assumeIsolated { self?.focused = responder }
+            // Deliver on the next tick: first-responder changes can happen inside SwiftUI view
+            // updates, and publishing there is undefined behavior (stale/missed redraws).
+            DispatchQueue.main.async { self?.focused = responder }
         }
     }
 
     func isFocused(_ view: NSView) -> Bool { focused == ObjectIdentifier(view) }
+
+    /// A terminal that should take keyboard focus as soon as it is on screen.
+    private weak var pending: NSView?
+
+    /// Focuses `view` now if it's in a window, otherwise as soon as it gets attached
+    /// (e.g. a sub-tab that SwiftUI hasn't swapped in yet).
+    func request(_ view: NSView) {
+        pending = view
+        // Wait a tick so SwiftUI finishes swapping views (and tearing down e.g. the palette field).
+        DispatchQueue.main.async { [weak self, weak view] in
+            if let view { self?.attached(view) }
+        }
+    }
+
+    /// Called by terminal hosts whenever a terminal lands in a window.
+    func attached(_ view: NSView) {
+        guard pending === view, let window = view.window else { return }
+        pending = nil
+        window.makeFirstResponder(view)
+    }
 }
 
 /// Which container currently owns each terminal view. SwiftUI can briefly keep an old and a
@@ -705,10 +768,39 @@ private enum TerminalOwnership {
     static let owners = NSMapTable<NSView, NSView>.weakToWeakObjects()
 }
 
+/// Sizes its terminal manually instead of with constraints. A freshly created host starts at zero
+/// size; letting the terminal follow that would resize the pty twice per tab switch, and each
+/// resize makes tmux and Claude redraw everything (slow for long conversations). The terminal
+/// only adopts a size once the container has a real one, and only when it actually changes.
 private final class TerminalContainer: NSView {
+    weak var hosted: NSView?
+    private static let minimumSide: CGFloat = 40
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        clipsToBounds = true
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        if let window { FocusTracker.shared.watch(window) }
+        guard let window else { return }
+        FocusTracker.shared.watch(window)
+        let views = subviews
+        DispatchQueue.main.async { views.forEach { FocusTracker.shared.attached($0) } }
+    }
+
+    override func layout() {
+        super.layout()
+        applyFrame()
+    }
+
+    func applyFrame() {
+        guard let hosted, hosted.superview === self,
+              bounds.width >= Self.minimumSide, bounds.height >= Self.minimumSide,
+              hosted.frame != bounds else { return }
+        hosted.frame = bounds
     }
 }
 
@@ -716,18 +808,17 @@ private final class TerminalContainer: NSView {
 /// so processes and scrollback survive tab switches.
 private struct TerminalHost: NSViewRepresentable {
     let view: NSView
-    let focusOnAppear: Bool
+    let isVisible: Bool
 
     func makeNSView(context: Context) -> NSView {
-        let container = TerminalContainer()
+        let container = TerminalContainer(frame: .zero)
+        container.isHidden = !isVisible
         claim(for: container)
-        if focusOnAppear {
-            DispatchQueue.main.async { [view] in view.window?.makeFirstResponder(view) }
-        }
         return container
     }
 
     func updateNSView(_ container: NSView, context: Context) {
+        if container.isHidden == isVisible { container.isHidden = !isVisible }
         let owner = TerminalOwnership.owners.object(forKey: view)
         // Re-attach only if this host owns the view, or the owner is gone/offscreen.
         guard owner === container || owner == nil || owner?.window == nil else { return }
@@ -736,17 +827,20 @@ private struct TerminalHost: NSViewRepresentable {
 
     private func claim(for container: NSView) {
         TerminalOwnership.owners.setObject(container, forKey: view)
+        // Removing from the old host drops its constraints; keep the terminal's current frame
+        // until the new host has a real size (see TerminalContainer).
+        let frame = view.frame
         view.removeFromSuperview()
-        view.translatesAutoresizingMaskIntoConstraints = false
+        view.translatesAutoresizingMaskIntoConstraints = true
+        view.autoresizingMask = []
+        view.frame = frame
         container.addSubview(view)
-        NSLayoutConstraint.activate([
-            view.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            view.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            view.topAnchor.constraint(equalTo: container.topAnchor),
-            view.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-        ])
-        view.needsLayout = true
+        (container as? TerminalContainer)?.hosted = view
+        (container as? TerminalContainer)?.applyFrame()
         view.needsDisplay = true
+        if container.window != nil {
+            DispatchQueue.main.async { [view] in FocusTracker.shared.attached(view) }
+        }
     }
 }
 
