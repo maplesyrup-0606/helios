@@ -630,22 +630,47 @@ private struct GitChip: View {
     let action: () -> Void
 
     var body: some View {
-        if git.isRepo {
+        if git.isRepo || git.remote != nil {
             Button(action: action) {
                 Chip(icon: "arrow.triangle.branch") {
-                    Text(git.branch)
-                    if !git.changes.isEmpty {
-                        Text("±\(git.changes.count)").foregroundStyle(theme.warn)
+                    if git.isRepo {
+                        Text(git.branch)
+                        if !git.changes.isEmpty {
+                            Text("±\(git.changes.count)").foregroundStyle(theme.warn)
+                        }
+                        if !git.tracking.isEmpty {
+                            Text(Self.arrows(git.tracking)).foregroundStyle(theme.textFaint)
+                        }
                     }
-                    if !git.tracking.isEmpty {
-                        Text(git.tracking.replacingOccurrences(of: "ahead ", with: "↑").replacingOccurrences(of: "behind ", with: "↓"))
-                            .foregroundStyle(theme.textFaint)
+                    if let remote = git.remote {
+                        if git.isRepo { Text("·").foregroundStyle(theme.textFaint) }
+                        Image(systemName: "server.rack").font(.system(size: 9)).foregroundStyle(theme.textFaint)
+                        // Highlighted when the cluster checkout is on a different branch than local.
+                        Text(remote.branch)
+                            .foregroundStyle(git.isRepo && remote.branch != git.branch ? theme.warn : theme.text)
+                        if remote.changeCount > 0 {
+                            Text("±\(remote.changeCount)").foregroundStyle(theme.warn)
+                        }
+                        if !remote.tracking.isEmpty {
+                            Text(Self.arrows(remote.tracking)).foregroundStyle(theme.textFaint)
+                        }
                     }
                 }
             }
             .buttonStyle(.plain)
-            .help("Git status")
+            .help(helpText)
         }
+    }
+
+    private var helpText: String {
+        var parts: [String] = []
+        if git.isRepo { parts.append("Local: \(git.branch)") }
+        if let remote = git.remote { parts.append("\(git.host ?? "Remote"): \(remote.branch)") }
+        return parts.joined(separator: " · ")
+    }
+
+    static func arrows(_ tracking: String) -> String {
+        tracking.replacingOccurrences(of: "ahead ", with: "↑").replacingOccurrences(of: "behind ", with: "↓")
     }
 }
 

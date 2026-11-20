@@ -48,16 +48,43 @@ final class GitMonitor: ObservableObject {
     @Published private(set) var changes: [Change] = []
     @Published private(set) var commits: [Commit] = []
 
-    private let directory: String
-    private lazy var poller = Poller(every: 10) { [weak self] in await self?.refresh() }
+    /// The checkout on the context's host, which can be on a different branch than the local one.
+    struct RemoteStatus: Equatable {
+        var branch: String
+        var tracking: String
+        var changeCount: Int
+    }
+    /// nil until read, or when the remote directory isn't a git repo.
+    @Published private(set) var remote: RemoteStatus?
 
-    init(directory: String) {
+    private let directory: String
+    let host: String?
+    private let remoteDir: String
+    private var remoteCheckedAt: Date?
+    private lazy var poller = Poller(every: 10) { [weak self] in await self?.poll() }
+    /// Each remote read is an ssh round trip, so it runs less often than the local one.
+    private static let remoteInterval: TimeInterval = 30
+
+    init(directory: String, host: String? = nil, remoteDir: String = "") {
         self.directory = directory
+        self.host = host
+        self.remoteDir = remoteDir.trimmingCharacters(in: .whitespaces)
     }
 
     func setActive(_ active: Bool) { poller.setActive(active) }
 
+    private func poll() async {
+        await refreshLocal()
+        if let last = remoteCheckedAt, Date().timeIntervalSince(last) < Self.remoteInterval { return }
+        await refreshRemote()
+    }
+
     func refresh() async {
+        await refreshLocal()
+        await refreshRemote()
+    }
+
+    private func refreshLocal() async {
         let dir = expandTilde(directory)
         let status = await Shell.run("/usr/bin/git", ["-C", dir, "status", "--porcelain=v1", "-b"], timeout: 10)
         guard status.ok else {
@@ -68,7 +95,7 @@ final class GitMonitor: ObservableObject {
         var lines = status.stdout.split(separator: "\n").map(String.init)
         if let header = lines.first, header.hasPrefix("## ") {
             lines.removeFirst()
-            parseHeader(String(header.dropFirst(3)))
+            (branch, tracking) = Self.parseHeader(String(header.dropFirst(3)))
         }
         changes = lines.compactMap { line in
             guard line.count > 3 else { return nil }
@@ -81,20 +108,36 @@ final class GitMonitor: ObservableObject {
         }
     }
 
-    /// Parses `main...origin/main [ahead 1, behind 2]` or `No commits yet on main`.
-    private func parseHeader(_ header: String) {
-        if header.hasPrefix("No commits yet on ") {
-            branch = String(header.dropFirst("No commits yet on ".count))
-            tracking = ""
-            return
+    private func refreshRemote() async {
+        guard let host, !remoteDir.isEmpty else { return }
+        let result = await Shell.remote(host, "git -C \(remoteShellPath(remoteDir)) status --porcelain=v1 -b", timeout: 15)
+        // 255: no shared connection yet (or it dropped); keep what we last saw and retry next tick.
+        if result.status == 255 { return }
+        remoteCheckedAt = Date()
+        remote = Self.parseRemote(result)
+    }
+
+    nonisolated static func parseRemote(_ result: CommandResult) -> RemoteStatus? {
+        guard result.ok else { return nil }
+        let lines = result.stdout.split(separator: "\n").map(String.init)
+        guard let header = lines.first, header.hasPrefix("## ") else { return nil }
+        let (branch, tracking) = parseHeader(String(header.dropFirst(3)))
+        return RemoteStatus(branch: branch, tracking: tracking, changeCount: lines.dropFirst().filter { $0.count > 3 }.count)
+    }
+
+    /// Parses `main...origin/main [ahead 1, behind 2]`, `No commits yet on main`,
+    /// or `HEAD (no branch)` into (branch, tracking).
+    nonisolated static func parseHeader(_ header: String) -> (branch: String, tracking: String) {
+        for prefix in ["No commits yet on ", "Initial commit on "] where header.hasPrefix(prefix) {
+            return (String(header.dropFirst(prefix.count)), "")
         }
+        if header.hasPrefix("HEAD (no branch)") { return ("detached HEAD", "") }
         let name = header.split(separator: " ").first.map(String.init) ?? header
-        branch = name.components(separatedBy: "...").first ?? name
-        if let open = header.firstIndex(of: "["), let close = header.lastIndex(of: "]") {
-            tracking = String(header[header.index(after: open)..<close])
-        } else {
-            tracking = ""
+        let branch = name.components(separatedBy: "...").first ?? name
+        if let open = header.firstIndex(of: "["), let close = header.lastIndex(of: "]"), open < close {
+            return (branch, String(header[header.index(after: open)..<close]))
         }
+        return (branch, "")
     }
 }
 

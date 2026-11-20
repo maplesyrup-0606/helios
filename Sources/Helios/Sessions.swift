@@ -408,7 +408,7 @@ final class ContextRuntime: ObservableObject {
 
     init(context: WorkContext) {
         self.context = context
-        git = GitMonitor(directory: context.localDir)
+        git = GitMonitor(directory: context.localDir, host: context.hasHost ? context.host : nil, remoteDir: context.remoteDir)
         jobs = context.hasHost ? JobsMonitor(host: context.host) : nil
         files = context.hasHost ? FileBrowser(host: context.host, startDir: context.remoteDir, localDir: context.localDir) : nil
         selectedRemoteTab = context.remoteTabs.first?.id

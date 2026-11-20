@@ -470,34 +470,68 @@ private struct GitPanel: View {
     @ObservedObject var git: GitMonitor
 
     var body: some View {
-        if !git.isRepo {
+        if !git.isRepo && git.remote == nil {
             Placeholder(text: "Not a git repository")
         } else {
-            HStack(alignment: .top, spacing: 0) {
-                column(title: "Changes · \(git.changes.count)") {
-                    if git.changes.isEmpty {
-                        Text("Working tree clean").font(.system(size: 11)).foregroundStyle(theme.textFaint)
-                    }
-                    ForEach(git.changes) { change in
-                        HStack(spacing: 10) {
-                            Text(change.status)
-                                .font(theme.mono(11, weight: .semibold))
-                                .foregroundStyle(color(for: change.status))
-                                .frame(width: 22, alignment: .leading)
-                            Text(change.path).font(theme.mono(11)).foregroundStyle(theme.textMuted)
-                                .lineLimit(1).truncationMode(.middle)
-                        }
+            VStack(spacing: 0) {
+                if let remote = git.remote {
+                    remoteRow(remote)
+                    Rectangle().fill(theme.hairline).frame(height: 1)
+                }
+                if git.isRepo {
+                    columns
+                } else {
+                    Placeholder(text: "Local folder is not a git repository")
+                }
+            }
+        }
+    }
+
+    /// The cluster checkout's status, which can differ from the local repo shown below it.
+    private func remoteRow(_ remote: GitMonitor.RemoteStatus) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "server.rack").font(.system(size: 10)).foregroundStyle(theme.textFaint)
+            Text(git.host ?? "remote").font(.system(size: 11)).foregroundStyle(theme.textFaint)
+            Text(remote.branch).font(theme.mono(11, weight: .semibold)).foregroundStyle(theme.accent)
+            Text(remote.changeCount == 0 ? "clean" : "\(remote.changeCount) changed")
+                .font(.system(size: 11)).foregroundStyle(remote.changeCount == 0 ? theme.textFaint : theme.warn)
+            if !remote.tracking.isEmpty {
+                Text(remote.tracking).font(.system(size: 11)).foregroundStyle(theme.textFaint)
+            }
+            if git.isRepo, remote.branch != git.branch {
+                Text("local is on \(git.branch)").font(.system(size: 11)).foregroundStyle(theme.warn)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+    }
+
+    private var columns: some View {
+        HStack(alignment: .top, spacing: 0) {
+            column(title: "Changes · \(git.changes.count)") {
+                if git.changes.isEmpty {
+                    Text("Working tree clean").font(.system(size: 11)).foregroundStyle(theme.textFaint)
+                }
+                ForEach(git.changes) { change in
+                    HStack(spacing: 10) {
+                        Text(change.status)
+                            .font(theme.mono(11, weight: .semibold))
+                            .foregroundStyle(color(for: change.status))
+                            .frame(width: 22, alignment: .leading)
+                        Text(change.path).font(theme.mono(11)).foregroundStyle(theme.textMuted)
+                            .lineLimit(1).truncationMode(.middle)
                     }
                 }
-                Rectangle().fill(theme.hairline).frame(width: 1)
-                column(title: "Recent commits") {
-                    ForEach(git.commits) { commit in
-                        HStack(spacing: 10) {
-                            Text(commit.id).font(theme.mono(11)).foregroundStyle(theme.accent)
-                            Text(commit.subject).font(.system(size: 12)).foregroundStyle(theme.textMuted).lineLimit(1)
-                            Spacer(minLength: 8)
-                            Text(commit.age).font(.system(size: 10)).foregroundStyle(theme.textFaint)
-                        }
+            }
+            Rectangle().fill(theme.hairline).frame(width: 1)
+            column(title: "Recent commits") {
+                ForEach(git.commits) { commit in
+                    HStack(spacing: 10) {
+                        Text(commit.id).font(theme.mono(11)).foregroundStyle(theme.accent)
+                        Text(commit.subject).font(.system(size: 12)).foregroundStyle(theme.textMuted).lineLimit(1)
+                        Spacer(minLength: 8)
+                        Text(commit.age).font(.system(size: 10)).foregroundStyle(theme.textFaint)
                     }
                 }
             }
