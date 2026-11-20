@@ -126,8 +126,21 @@ final class JobsMonitor: ObservableObject {
         case error(String)
     }
 
+    /// Latest tqdm line from a running job's log, parsed.
+    struct Progress: Equatable {
+        var fraction: Double
+        var label: String
+        var counts: String
+        var elapsed: String
+        var remaining: String
+        var rate: String
+        var postfix: String
+    }
+
     @Published private(set) var status: Status = .loading
     @Published private(set) var jobs: [Job] = []
+    /// Keyed by job id; only running jobs whose logs contain a tqdm bar.
+    @Published private(set) var progress: [String: Progress] = [:]
     @Published private(set) var lastUpdated: Date?
     /// Output of the last on-demand command (nvidia-smi, quota), shown in the drawer.
     @Published private(set) var detailTitle = ""
@@ -176,6 +189,56 @@ final class JobsMonitor: ObservableObject {
         }
         status = .ok
         lastUpdated = Date()
+        await refreshProgress()
+    }
+
+    /// Reads the tail of each running job's StdErr/StdOut and keeps the last tqdm line.
+    private func refreshProgress() async {
+        let running = jobs.filter(\.isRunning).map(\.id)
+        guard !running.isEmpty else {
+            progress = [:]
+            return
+        }
+        let result = await Shell.remote(host, Self.progressCommand(jobIDs: running), timeout: 20)
+        guard result.ok else { return }
+        var parsed: [String: Progress] = [:]
+        var current: String?
+        for line in result.stdout.split(separator: "\n", omittingEmptySubsequences: true).map(String.init) {
+            if line.hasPrefix("@@@ ") {
+                current = String(line.dropFirst(4))
+            } else if let id = current, let p = Self.parseTqdm(line) {
+                parsed[id] = p
+            }
+        }
+        progress = parsed
+    }
+
+    /// Remote shell snippet printing `@@@ <id>` then that job's last tqdm line, per job.
+    nonisolated static func progressCommand(jobIDs: [String]) -> String {
+        // Job ids come from squeue (digits, `_`, `[`/`]` for arrays); quote them anyway.
+        let ids = jobIDs.map { "'\($0)'" }.joined(separator: " ")
+        return """
+        for j in \(ids); do echo "@@@ $j"; \
+        scontrol show job "$j" 2>/dev/null | sed -n 's/^ *Std\\(Out\\|Err\\)=//p' | sort -u | \
+        while read -r f; do [ -r "$f" ] && tail -c 16384 "$f"; echo; done | \
+        tr '\\r' '\\n' | grep -E '[0-9]{1,3}%\\|' | tail -n 1; done
+        """
+    }
+
+    nonisolated private static let tqdmPattern = try! NSRegularExpression(pattern:
+        #"^\s*(?:(.*?):?\s*)?(\d{1,3})%\|[^|]*\|\s*([^\s\[]+)\s*\[([^<\]]*)(?:<([^,\]]*))?(?:,\s*([^,\]]*))?(?:,\s*(.*))?\]"#)
+
+    /// Parses e.g. `Epoch 2:  45%|████▌     | 450/1000 [01:23<01:40,  5.50it/s, loss=0.12]`.
+    nonisolated static func parseTqdm(_ line: String) -> Progress? {
+        let ns = line as NSString
+        guard let m = tqdmPattern.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)) else { return nil }
+        func group(_ i: Int) -> String {
+            let r = m.range(at: i)
+            return r.location == NSNotFound ? "" : ns.substring(with: r).trimmingCharacters(in: .whitespaces)
+        }
+        guard let percent = Double(group(2)) else { return nil }
+        return Progress(fraction: min(1, percent / 100), label: group(1), counts: group(3),
+                        elapsed: group(4), remaining: group(5), rate: group(6), postfix: group(7))
     }
 
     /// GPU usage on the login node, or inside a running job's allocation.

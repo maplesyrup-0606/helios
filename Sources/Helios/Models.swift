@@ -12,8 +12,10 @@ struct WorkContext: Codable, Identifiable, Equatable {
     var name: String
     /// Local working directory for the left terminal.
     var localDir: String
-    /// Command typed into the local shell on launch (e.g. `claude`). Empty for none.
+    /// Command run when the local session is first created (e.g. `claude`). Empty for none.
     var startupCommand: String = "claude"
+    /// Add `--continue` to a `claude` startup command when the project has past conversations.
+    var resumeConversation = true
     /// Host alias from ~/.ssh/config (or user@host). Empty disables the SSH panel.
     var host: String = ""
     /// Directory the remote tmux session starts in. Empty means the remote home.
@@ -37,6 +39,7 @@ struct WorkContext: Codable, Identifiable, Equatable {
         name = try c.decode(String.self, forKey: .name)
         localDir = try c.decode(String.self, forKey: .localDir)
         startupCommand = try c.decodeIfPresent(String.self, forKey: .startupCommand) ?? "claude"
+        resumeConversation = try c.decodeIfPresent(Bool.self, forKey: .resumeConversation) ?? true
         host = try c.decodeIfPresent(String.self, forKey: .host) ?? ""
         remoteDir = try c.decodeIfPresent(String.self, forKey: .remoteDir) ?? ""
         notes = try c.decodeIfPresent(String.self, forKey: .notes) ?? ""

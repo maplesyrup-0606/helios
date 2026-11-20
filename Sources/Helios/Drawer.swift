@@ -298,6 +298,7 @@ private struct JobsPanel: View {
                     JobRow.header
                     ForEach(jobs.jobs) { job in
                         JobRow(job: job,
+                               progress: jobs.progress[job.id],
                                onGPU: { Task { await jobs.showGPU(for: job) } },
                                onDetails: { Task { await jobs.showJobDetails(job) } },
                                onCancel: { pendingCancel = job })
@@ -335,6 +336,7 @@ private struct JobsPanel: View {
 
 private struct JobRow: View {
     let job: JobsMonitor.Job
+    let progress: JobsMonitor.Progress?
     let onGPU: () -> Void
     let onDetails: () -> Void
     let onCancel: () -> Void
@@ -372,6 +374,20 @@ private struct JobRow: View {
     }
 
     var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            mainLine
+            if let progress {
+                ProgressLine(progress: progress)
+                    .padding(.leading, 38)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 5)
+        .background(RoundedRectangle(cornerRadius: 6).fill(isHovered ? theme.fill : .clear).padding(.horizontal, 4))
+        .onHover { isHovered = $0 }
+    }
+
+    private var mainLine: some View {
         HStack(spacing: 10) {
             Text(stateCode)
                 .font(theme.mono(10, weight: .semibold))
@@ -399,10 +415,52 @@ private struct JobRow: View {
         .font(theme.mono(11))
         .foregroundStyle(theme.textMuted)
         .lineLimit(1)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 5)
-        .background(RoundedRectangle(cornerRadius: 6).fill(isHovered ? theme.fill : .clear).padding(.horizontal, 4))
-        .onHover { isHovered = $0 }
+    }
+}
+
+/// tqdm progress for a running job: bar, percent, counts, ETA, rate, postfix.
+private struct ProgressLine: View {
+    let progress: JobsMonitor.Progress
+
+    var body: some View {
+        HStack(spacing: 10) {
+            if !progress.label.isEmpty {
+                Text(progress.label).foregroundStyle(theme.text)
+            }
+            ProgressBar(fraction: progress.fraction)
+                .frame(width: 140, height: 5)
+            Text("\(Int((progress.fraction * 100).rounded()))%")
+                .foregroundStyle(theme.accent)
+                .frame(width: 34, alignment: .trailing)
+            Text(progress.counts)
+            if !progress.remaining.isEmpty && progress.remaining != "?" {
+                Text("eta \(progress.remaining)").foregroundStyle(theme.text)
+            }
+            if !progress.rate.isEmpty { Text(progress.rate).foregroundStyle(theme.textFaint) }
+            if !progress.postfix.isEmpty {
+                Text(progress.postfix).foregroundStyle(theme.textFaint).truncationMode(.tail)
+            }
+        }
+        .font(theme.mono(10.5))
+        .foregroundStyle(theme.textMuted)
+        .lineLimit(1)
+    }
+}
+
+struct ProgressBar: View {
+    let fraction: Double
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(theme.fillStrong)
+                Capsule()
+                    .fill(LinearGradient(colors: [theme.accent.opacity(0.7), theme.accent], startPoint: .leading, endPoint: .trailing))
+                    .frame(width: max(geo.size.height, geo.size.width * fraction))
+                    .shadow(color: theme.accent.opacity(0.5), radius: 3)
+            }
+        }
+        .animation(.easeOut(duration: 0.4), value: fraction)
     }
 }
 

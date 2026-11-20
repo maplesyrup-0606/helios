@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UserNotifications
 
 enum DrawerTab: String, CaseIterable, Identifiable {
     case jobs = "Jobs", git = "Git", notes = "Notes", files = "Files"
@@ -11,7 +12,12 @@ enum DrawerTab: String, CaseIterable, Identifiable {
 @MainActor
 final class AppModel: ObservableObject {
     let store = ContextStore()
-    @Published var selectedID: UUID?
+    @Published var selectedID: UUID? {
+        didSet { if let selectedID { clearAttention(selectedID) } }
+    }
+    /// Background contexts that want attention (bell, or Claude went quiet).
+    @Published private(set) var attention: [UUID: ContextRuntime.Attention] = [:]
+    @Published var isPaletteOpen = false
     /// Context being edited in the sheet; `isNewContext` distinguishes add from edit.
     @Published var editing: WorkContext?
     @Published var isNewContext = false
@@ -30,6 +36,8 @@ final class AppModel: ObservableObject {
     func runtime(for context: WorkContext) -> ContextRuntime {
         if let existing = runtimes[context.id] { return existing }
         let runtime = ContextRuntime(context: context)
+        let id = context.id
+        runtime.onAttention = { [weak self] kind in self?.flag(id, kind) }
         runtimes[context.id] = runtime
         return runtime
     }
@@ -66,8 +74,13 @@ final class AppModel: ObservableObject {
             let old = store.contexts[index]
             store.contexts[index] = context
             // Restart terminals only when something they were launched with changed.
-            if old.localDir != context.localDir || old.startupCommand != context.startupCommand
-                || old.host != context.host || old.remoteDir != context.remoteDir {
+            // The startup command only applies to newly created sessions, so editing it never
+            // interrupts a running one. A new local dir needs a fresh local tmux session.
+            if old.localDir != context.localDir || old.host != context.host || old.remoteDir != context.remoteDir {
+                if old.localDir != context.localDir {
+                    runtimes[context.id]?.shutdown()
+                    LocalTmux.kill(old)
+                }
                 restart(context.id)
             } else {
                 runtimes[context.id]?.update(context)
@@ -82,6 +95,8 @@ final class AppModel: ObservableObject {
     func delete(_ id: UUID) {
         objectWillChange.send()
         runtimes.removeValue(forKey: id)?.shutdown()
+        if let context = store.contexts.first(where: { $0.id == id }) { LocalTmux.kill(context) }
+        clearAttention(id)
         store.contexts.removeAll { $0.id == id }
         if selectedID == id { selectedID = store.contexts.first?.id }
         editing = nil
@@ -102,6 +117,40 @@ final class AppModel: ObservableObject {
         objectWillChange.send()
         change(&store.contexts[index])
         runtimes[id]?.update(store.contexts[index])
+    }
+
+    // MARK: Attention
+
+    private func flag(_ id: UUID, _ kind: ContextRuntime.Attention) {
+        // The context on screen in the active app is already being looked at.
+        if id == selectedID && NSApp.isActive { return }
+        if let existing = attention[id], existing >= kind { return }
+        attention[id] = kind
+        updateDockBadge()
+        guard !NSApp.isActive, let context = store.contexts.first(where: { $0.id == id }) else { return }
+        NSApp.requestUserAttention(.informationalRequest)
+        Notifier.post(title: context.name, body: kind == .bell ? "Terminal bell" : "Finished — waiting for you")
+    }
+
+    func clearAttention(_ id: UUID) {
+        guard attention[id] != nil else { return }
+        attention[id] = nil
+        updateDockBadge()
+    }
+
+    /// When the app comes back to the front, the visible context counts as seen.
+    func appDidBecomeActive() {
+        if let selectedID { clearAttention(selectedID) }
+    }
+
+    private func updateDockBadge() {
+        NSApp.dockTile.badgeLabel = attention.isEmpty ? nil : "\(attention.count)"
+    }
+
+    /// Returns keyboard focus to the selected context's local terminal.
+    func focusSelectedTerminal() {
+        guard let selected, let runtime = runtimes[selected.id] else { return }
+        DispatchQueue.main.async { runtime.local.terminal.window?.makeFirstResponder(runtime.local.terminal) }
     }
 
     func toggleDrawer(_ tab: DrawerTab? = nil) {
@@ -138,7 +187,37 @@ final class AppModel: ObservableObject {
     }
 }
 
+/// macOS notifications; only available when running as a bundled .app.
+enum Notifier {
+    private static var authorized = false
+    private static var requested = false
+
+    static func post(title: String, body: String) {
+        guard Bundle.main.bundleIdentifier != nil else { return }
+        let center = UNUserNotificationCenter.current()
+        let send = {
+            let content = UNMutableNotificationContent()
+            content.title = title
+            content.body = body
+            center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+        }
+        if authorized { send(); return }
+        guard !requested else { return }
+        requested = true
+        center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
+            authorized = granted
+            if granted { send() }
+        }
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    var onBecomeActive: (() -> Void)?
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        onBecomeActive?()
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Needed when launched as a bare executable (swift run) rather than a .app bundle.
         NSApp.setActivationPolicy(.regular)
@@ -164,6 +243,7 @@ struct HeliosApp: App {
         Window("Helios", id: "main") {
             ContentView()
                 .environmentObject(model)
+                .onAppear { appDelegate.onBecomeActive = { [weak model] in model?.appDidBecomeActive() } }
                 .frame(minWidth: 900, minHeight: 500)
                 .preferredColorScheme(.dark)
         }
@@ -179,6 +259,10 @@ struct HeliosApp: App {
                 Divider()
                 Button("New SSH Tab") { model.addRemoteTab() }
                     .keyboardShortcut("t", modifiers: [.command, .option])
+            }
+            CommandMenu("Go") {
+                Button("Command Palette…") { model.isPaletteOpen.toggle() }
+                    .keyboardShortcut("k", modifiers: .command)
             }
             CommandMenu("Panels") {
                 Button("Toggle Drawer") { model.toggleDrawer() }

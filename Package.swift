@@ -13,5 +13,10 @@ let package = Package(
             dependencies: ["SwiftTerm"],
             path: "Sources/Helios"
         ),
+        .testTarget(
+            name: "HeliosTests",
+            dependencies: ["Helios"],
+            path: "Tests/HeliosTests"
+        ),
     ]
 )

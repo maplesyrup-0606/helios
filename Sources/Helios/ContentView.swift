@@ -27,6 +27,14 @@ struct ContentView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .background(WindowGlass())
+        .overlay {
+            if model.isPaletteOpen {
+                CommandPalette()
+                    .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .top)))
+            }
+        }
+        .animation(.snappy(duration: 0.18), value: model.isPaletteOpen)
+        .animation(.snappy(duration: 0.2), value: model.attention)
         .foregroundStyle(theme.text)
         .ignoresSafeArea()
         .sheet(item: $model.editing) { context in
@@ -122,7 +130,9 @@ private struct SidebarRow: View {
                     .truncationMode(.middle)
             }
             Spacer(minLength: 4)
-            if index < 9 && isHovered {
+            if let attention = model.attention[context.id] {
+                AttentionBadge(kind: attention)
+            } else if index < 9 && isHovered {
                 Text("⌘\(index + 1)")
                     .font(theme.mono(10))
                     .foregroundStyle(theme.textFaint)
@@ -154,8 +164,30 @@ private struct SidebarRow: View {
     }
 }
 
+/// Glowing dot on a background context: accent for a bell, green when Claude went quiet.
+private struct AttentionBadge: View {
+    let kind: ContextRuntime.Attention
+    @State private var pulse = false
+
+    var body: some View {
+        let color = kind == .bell ? theme.accent : theme.ok
+        ZStack {
+            Circle().fill(color.opacity(0.35)).frame(width: 14, height: 14)
+                .scaleEffect(pulse ? 1.25 : 0.8)
+                .opacity(pulse ? 0 : 1)
+            Circle().fill(color).frame(width: 7, height: 7)
+                .shadow(color: color.opacity(0.8), radius: 4)
+        }
+        .onAppear {
+            withAnimation(.easeOut(duration: 1.4).repeatForever(autoreverses: false)) { pulse = true }
+        }
+        .help(kind == .bell ? "Terminal bell" : "Finished — waiting for you")
+        .transition(.scale.combined(with: .opacity))
+    }
+}
+
 /// Rounded initial in the context's hue, with an SSH status dot in the corner.
-private struct Monogram: View {
+struct Monogram: View {
     let context: WorkContext
     let ssh: SSHSession?
     let size: CGFloat
@@ -559,6 +591,10 @@ private struct JobsChip: View {
                         if jobs.pendingCount > 0 { Text("\(jobs.pendingCount) PD").foregroundStyle(theme.warn) }
                         let other = jobs.jobs.count - jobs.runningCount - jobs.pendingCount
                         if other > 0 { Text("\(other) other") }
+                        if let p = jobs.jobs.lazy.compactMap({ jobs.progress[$0.id] }).first {
+                            ProgressBar(fraction: p.fraction).frame(width: 34, height: 4)
+                            Text("\(Int((p.fraction * 100).rounded()))%").foregroundStyle(theme.accent)
+                        }
                     }
                 }
             }
@@ -770,6 +806,11 @@ private struct ContextEditor: View {
                         Button("Choose…", action: chooseDirectory)
                     }
                     TextField("Startup command", text: $draft.startupCommand, prompt: Text("claude"))
+                    Toggle("Resume last Claude conversation", isOn: $draft.resumeConversation)
+                    Text("The startup command runs only when Helios creates a new local session (first open, after a reboot, or after the shell exits). Otherwise Helios reattaches to what's already running. With resume on, `claude` becomes `claude --continue` when this folder has past conversations.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 Section("Remote") {
                     HStack {

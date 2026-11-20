@@ -28,6 +28,7 @@ Contexts are listed in the left sidebar; the strip at the top of each one shows 
 | ⌥⌘T | New SSH sub-tab |
 | ⌘I | Toggle drawer |
 | ⌥⌘1…⌥⌘4 | Drawer: Jobs / Git / Notes / Files |
+| ⌘K | Command palette |
 
 ## Theme
 
@@ -42,13 +43,14 @@ The right pane runs `ssh -t <host> tmux new-session -A -s helios-<id> [-c <remot
 - If tmux isn't on the remote `PATH`, it falls back to a plain login shell (no persistence).
 - Clusters with round-robin login nodes: point the host at a specific node (e.g. `login1`) so you reattach to the node holding your tmux session.
 
-The **local** pane is a normal shell; quitting Helios ends local processes (e.g. a running `claude`).
+The **local** pane runs in a local tmux session (`helios-local-<id>`) when tmux is installed, so a running `claude` survives quitting/updating Helios. The startup command runs only when a new local session is created (first open, after a reboot, or after the shell exits); otherwise Helios reattaches. With **Resume last Claude conversation** on (default), a `claude` startup command becomes `claude --continue` when `~/.claude/projects/<dir>` has past conversations. Changing the local dir or deleting the context kills the session; editing the startup command doesn't interrupt a running one. Helios-owned tmux sessions (local and remote) set `status off` and `mouse on` per session: the wheel scrolls tmux history; **Shift+drag** selects text natively.
 
 ## Panels
 
 The info strip at the top of a context shows chips for the local dir, git branch (±changes, ↑↓ vs upstream), SSH status, and SLURM jobs (running / pending). Clicking a chip opens the drawer under the terminals:
 
 - **Jobs** — `squeue -u $USER`, refreshed every 30s while the context is on screen. Hover a job for `gpu` (`srun --jobid --overlap nvidia-smi`), `info` (`scontrol show job`), `cancel` (`scancel`, confirmed). Toolbar: login-node GPU and disk quota (`diskusage_report` on Alliance clusters, else `quota`/`df`). Hidden on hosts without SLURM.
+- Running jobs show **tqdm progress** (bar, %, counts, ETA, rate, postfix) parsed from the tail of their StdErr/StdOut files; the jobs chip shows the first one's %.
 - **Git** — changed files and recent commits for the local dir, refreshed every 10s.
 - **Notes** — per-context scratchpad, saved with the context.
 - **Files** — browse the remote dir; double-click folders, `cd here` sends `cd` to the SSH tab, download selection into the local dir, upload via picker or drag-and-drop from Finder (rsync).
@@ -59,6 +61,14 @@ Background remote commands only run over an already-authenticated shared connect
 
 The local/remote split and the drawer height are draggable and remembered.
 
+## Attention
+
+A background context gets a pulsing sidebar badge (and the dock icon a count) when:
+- a terminal rings the **bell** (accent badge), or
+- the local pane **went quiet** after ≥3s of continuous output, e.g. Claude finished or is waiting for input (green badge).
+
+When Helios isn't the active app it also bounces the dock icon and posts a macOS notification. Badges clear when you open the context. For precise Claude signals, set Claude Code's notification channel to the terminal bell (`/config` → notifications → terminal bell).
+
 ## Roadmap
 
-All originally planned features are in. Ideas: run the local pane inside tmux too (so `claude` survives app restarts); activity badges on background contexts.
+Ideas: follow a full job log in the drawer; per-context hue override.
