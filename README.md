@@ -30,7 +30,6 @@ Contexts are listed in the left sidebar; the strip at the top of each one shows 
 | ⇧⌘← / ⇧⌘→ | Previous / next SSH sub-tab |
 | ⌘W | Close current SSH sub-tab (asks first; the main tab can't be closed) |
 | ⌘I | Toggle drawer |
-| ⌥⌘1…⌥⌘4 | Drawer: Jobs / Git / Notes / Files |
 | ⌘K | Command palette |
 | ⌘[ / ⌘] | Focus local / SSH pane |
 

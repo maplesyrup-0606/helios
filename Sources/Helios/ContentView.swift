@@ -566,11 +566,11 @@ private struct ContextHeader: View {
             Spacer(minLength: 8)
             HStack(spacing: 2) {
                 if context.hasHost {
-                    IconButton(systemName: "folder", help: "Remote files (⌥⌘4)", isActive: model.drawerTab == .files) {
+                    IconButton(systemName: "folder", help: "Remote files", isActive: model.drawerTab == .files) {
                         toggle(.files)
                     }
                 }
-                IconButton(systemName: "note.text", help: "Notes (⌥⌘3)", isActive: model.drawerTab == .notes) {
+                IconButton(systemName: "note.text", help: "Notes", isActive: model.drawerTab == .notes) {
                     toggle(.notes)
                 }
                 IconButton(systemName: "rectangle.bottomthird.inset.filled", help: "Toggle drawer (⌘I)", isActive: model.drawerTab != nil) {
@@ -612,7 +612,7 @@ private struct GitChip: View {
                 }
             }
             .buttonStyle(.plain)
-            .help("Git status (⌥⌘2)")
+            .help("Git status")
         }
     }
 }
@@ -640,7 +640,7 @@ private struct JobsChip: View {
                 }
             }
             .buttonStyle(.plain)
-            .help("SLURM jobs (⌥⌘1)")
+            .help("SLURM jobs")
         }
     }
 }

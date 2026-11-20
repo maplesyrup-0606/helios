@@ -36,7 +36,7 @@ struct CommandPalette: View {
         ]
         for (index, tab) in DrawerTab.allCases.enumerated() where !tab.needsHost || model.selected?.hasHost == true {
             items.append(Item(id: "drawer-\(tab.rawValue)", title: "Show \(tab.rawValue)", icon: icon(for: tab),
-                              shortcut: "⌥⌘\(index + 1)", keepsFocus: tab == .notes) {
+                              keepsFocus: tab == .notes) {
                 if model.drawerTab != tab { model.toggleDrawer(tab) }
             })
         }

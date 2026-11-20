@@ -343,7 +343,6 @@ struct HeliosApp: App {
                 Divider()
                 ForEach(Array(DrawerTab.allCases.enumerated()), id: \.element) { index, tab in
                     Button(tab.rawValue) { model.toggleDrawer(tab) }
-                        .keyboardShortcut(KeyEquivalent(Character("\(index + 1)")), modifiers: [.command, .option])
                 }
             }
             CommandMenu("Contexts") {
