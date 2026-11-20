@@ -57,7 +57,7 @@ struct CommandPalette: View {
                     model.addTab(.remote)
                 },
                 Item(id: "reconnect", title: "Reconnect SSH", icon: "arrow.triangle.2.circlepath") {
-                    if let selected = model.selected { model.existingRuntime(for: selected.id)?.visibleSSH?.reconnectNow() }
+                    if let selected = model.selected { model.existingRuntime(for: selected.id)?.visibleSSH?.refresh() }
                 },
             ]
         }

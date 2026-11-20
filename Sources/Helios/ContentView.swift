@@ -594,6 +594,9 @@ private struct ContextHeader: View {
             }
             Spacer(minLength: 8)
             HStack(spacing: 2) {
+                if let ssh = runtime.visibleSSH {
+                    IconButton(systemName: "arrow.clockwise", help: "Refresh SSH pane") { ssh.refresh() }
+                }
                 if context.hasHost {
                     IconButton(systemName: "folder", help: "Remote files", isActive: model.drawerTab == .files) {
                         toggle(.files)

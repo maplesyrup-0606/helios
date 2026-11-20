@@ -23,12 +23,83 @@ final class HeliosTerminalView: LocalProcessTerminalView {
 
     override func dataReceived(slice: ArraySlice<UInt8>) {
         super.dataReceived(slice: slice)
+        scheduleFullRepaint()
         onOutput?()
+    }
+
+    private var repaintWork: DispatchWorkItem?
+
+    /// SwiftTerm's partial redraws can leave stale rows on screen (e.g. ECH `ESC[nX` never marks
+    /// its row dirty), which garbled multi-line command editing under tmux. Once output pauses,
+    /// repaint the whole pane so anything missed heals within a frame or two.
+    private func scheduleFullRepaint() {
+        repaintWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            getTerminal().updateFullScreen()
+            setNeedsDisplay(bounds)
+        }
+        repaintWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03, execute: work)
+    }
+
+    // Clicks and drags always select natively (tmux mouse mode would otherwise grab them into
+    // copy-mode, whose selection never reaches the macOS clipboard). The wheel still goes to
+    // tmux, since `scrollWheel` reads `allowMouseReporting` outside these overrides.
+    override func mouseDown(with event: NSEvent) { withoutMouseReporting { super.mouseDown(with: event) } }
+    override func mouseDragged(with event: NSEvent) { withoutMouseReporting { super.mouseDragged(with: event) } }
+    override func mouseUp(with event: NSEvent) { withoutMouseReporting { super.mouseUp(with: event) } }
+
+    private func withoutMouseReporting(_ body: () -> Void) {
+        allowMouseReporting = false
+        body()
+        allowMouseReporting = true
+    }
+
+    /// The default clears the selection on every linefeed, so streaming output made it vanish.
+    override func linefeed(source: Terminal) {}
+
+    /// Cmd-C with nothing selected would otherwise wipe the clipboard. Text that claude wrapped to
+    /// the pane width is copied as the original single line, so pasting it needs no cleanup.
+    override func copy(_ sender: Any) {
+        guard selection.active else { return }
+        let (s, e) = (selection.start, selection.end)
+        let firstColumn = (s.row, s.col) < (e.row, e.col) ? s.col : e.col
+        let text = selection.getSelectedText()
+        let unwrapped = WrappedText.unwrap(text, firstColumn: firstColumn, cols: getTerminal().cols)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(unwrapped ?? text, forType: .string)
+    }
+
+    /// macOS line-editing shortcuts, sent the way Ghostty/iTerm do. SwiftTerm sends Option-←/→ as
+    /// `ESC[1;3D`-style sequences that shells (and claude, via tmux) print as stray "D"/"C", and its
+    /// `keyDown` isn't overridable, so a local monitor rewrites these keys before it sees them.
+    private static let lineEditingMonitor: Any? = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+        guard let view = NSApp.keyWindow?.firstResponder as? HeliosTerminalView,
+              let bytes = lineEditingBytes(for: event) else { return event }
+        view.selection.active = false
+        view.send(bytes)
+        return nil
+    }
+
+    static func installLineEditingKeys() { _ = lineEditingMonitor }
+
+    private static func lineEditingBytes(for event: NSEvent) -> [UInt8]? {
+        switch (event.modifierFlags.intersection([.command, .shift, .option, .control]), event.specialKey) {
+        case (.option, .leftArrow?): [0x1b, 0x62]   // ESC b: word back
+        case (.option, .rightArrow?): [0x1b, 0x66]  // ESC f: word forward
+        case (.option, .delete?): [0x1b, 0x7f]      // ESC DEL: delete word back
+        case (.command, .leftArrow?): [0x01]        // Ctrl-A: start of line
+        case (.command, .rightArrow?): [0x05]       // Ctrl-E: end of line
+        case (.command, .delete?): [0x15]           // Ctrl-U: delete to start of line
+        default: nil
+        }
     }
 }
 
 @MainActor
 private func makeTerminalView() -> HeliosTerminalView {
+    HeliosTerminalView.installLineEditingKeys()
     let view = HeliosTerminalView(frame: NSRect(x: 0, y: 0, width: 600, height: 400))
     view.optionAsMetaKey = true
     Theme.current.apply(to: view)
@@ -53,7 +124,7 @@ func remoteShellPath(_ path: String) -> String {
 }
 
 /// Session-scoped (not global) tmux options for Helios-owned sessions: Helios draws its own tabs,
-/// and mouse mode makes the wheel scroll tmux history. Shift+drag still selects text natively.
+/// and mouse mode makes the wheel scroll tmux history. Clicks and drags stay native (see HeliosTerminalView).
 let tmuxSessionOptions = [("status", "off"), ("mouse", "on")]
 
 /// Local tmux, used so the left pane (e.g. a running `claude`) survives app restarts.
@@ -251,6 +322,14 @@ final class SSHSession: NSObject, ObservableObject, @preconcurrency LocalProcess
     func reconnectNow() {
         attempt = 0
         if state == .running { return }
+        connect()
+    }
+
+    /// Kills ssh even while it looks connected (e.g. a frozen pane) and reattaches tmux.
+    /// `terminate()` doesn't call `processTerminated`, so no auto-retry races this connect.
+    func refresh() {
+        attempt = 0
+        if state == .running { terminal.terminate() }
         connect()
     }
 

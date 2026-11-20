@@ -1,77 +1,149 @@
 # Helios
 
-One window, many research contexts. Each tab pairs a **local terminal** (usually Claude Code in a project directory) on the left with an **SSH session** to a cluster or VM on the right, replacing the multiple-desktops-with-Termius setup.
+One window, many research contexts. Each context pairs a **local terminal** (usually [Claude Code](https://claude.com/claude-code) in a project directory) on the left with an **SSH session** to a cluster or VM on the right, with git, SLURM jobs, remote files and notes one click away. It replaces juggling multiple desktops, terminal windows and an SSH client.
 
-## Build & run
+- Terminals keep running while you switch contexts, and survive quitting Helios (local and remote panes live in tmux).
+- SSH panes auto-reconnect and share one authenticated connection per host, so 2FA is approved once.
+- An info strip and drawer show git status, SLURM jobs (with tqdm progress), remote files and per-context notes.
+- Background contexts get a badge when Claude finishes or a terminal rings the bell.
+
+## Installation
+
+### Requirements
+
+- macOS 14 (Sonoma) or later
+- Xcode or the Xcode Command Line Tools (`xcode-select --install`), for Swift
+- [tmux](https://github.com/tmux/tmux) locally (`brew install tmux`), recommended so local panes survive restarts
+- tmux on remote hosts, recommended so SSH sessions survive disconnects
+
+### Build and install
 
 ```sh
-swift run                         # dev
-./scripts/build-app.sh            # -> build.noindex/Helios.app
-./scripts/build-app.sh --install  # also installs to /Applications (Spotlight, Launchpad, Dock)
-./scripts/relaunch.sh            # quit Helios, wait for it to exit, reopen (installed copy if present)
+git clone https://github.com/maplesyrup-0606/helios.git
+cd helios
+./scripts/build-app.sh --install
 ```
 
-Requires macOS 14+ and the Xcode toolchain. Terminal emulation is [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm), pinned to 1.20.0 (1.99.x doesn't compile with Swift 6.2).
+This builds a release `Helios.app` and copies it to `/Applications`, so it shows up in Spotlight, Launchpad and the Dock. The app is ad-hoc signed on your machine, so it opens without Gatekeeper warnings.
 
-## Contexts
+### Updating
 
-A context stores: name, local directory, startup command (default `claude`), SSH host (alias from `~/.ssh/config` or `user@host`), and an optional remote directory. Saved to `~/Library/Application Support/Helios/contexts.json`.
+```sh
+git pull
+./scripts/build-app.sh --install
+./scripts/relaunch.sh    # quits Helios, waits for it to exit, reopens the installed copy
+```
 
-Contexts are listed in the left sidebar; the strip at the top of each one shows its local dir and SSH status. Terminals start the first time a context is opened and keep running while you switch.
+Running terminals aren't lost: Helios reattaches to their tmux sessions on launch.
+
+### Other build options
+
+```sh
+swift run                      # run a debug build straight from the checkout
+./scripts/build-app.sh         # build build.noindex/Helios.app without installing
+swift test                     # run the tests
+```
+
+## Quick start
+
+1. Open Helios and press **⌘T** to create a context.
+2. Fill in:
+   - **Name**: anything, e.g. `geodesic`.
+   - **Local directory**: the project folder the left pane opens in.
+   - **Startup command**: what the left pane runs, `claude` by default.
+   - **SSH host**: an alias from `~/.ssh/config` or `user@host`. Leave empty for a local-only context.
+   - **Remote directory** (optional): where the remote shell starts.
+3. The left pane starts Claude Code in your project, and the right pane connects over SSH. Approve 2FA in the right pane if your host asks.
+4. Add more contexts with ⌘T and switch between them from the sidebar or with ⌘1…⌘9.
+
+Contexts are saved to `~/Library/Application Support/Helios/contexts.json`.
+
+## Usage
+
+### Layout
+
+- **Sidebar**: your contexts. A badge means something happened there while you were away (see [Attention](#attention)).
+- **Info strip** (top): chips for git branch, SSH status and SLURM jobs, plus buttons for refresh, remote files, notes, the drawer and editing the context.
+- **Panes**: local on the left, SSH on the right. Drag the divider to resize; the split is remembered.
+- **Sub-tabs** above each pane: ⇧⌘T opens another shell in the focused pane. Local sub-tabs are plain shells in the project directory; SSH sub-tabs are extra tmux sessions over the same connection.
+- **Drawer** (⌘I): jobs, git, notes and files under the terminals. Its height is draggable and remembered.
+
+### Keyboard shortcuts
 
 | Shortcut | Action |
 |---|---|
 | ⌘T | New context |
 | ⇧⌘E | Edit current context |
-| ⇧⌘R | Restart current context's terminals |
 | ⌘1…⌘9 | Jump to context |
 | ⇧⌘[ / ⇧⌘] | Previous / next context |
-| ⇧⌘T | New sub-tab in the focused pane (local or SSH) |
+| ⌘[ / ⌘] | Focus local / SSH pane |
+| ⇧⌘T | New sub-tab in the focused pane |
 | ⇧⌘← / ⇧⌘→ | Previous / next sub-tab in the focused pane |
 | ⌘W | Close the focused pane's sub-tab (asks first; a pane's first tab can't be closed) |
 | ⌘I | Toggle drawer |
 | ⌘K | Command palette |
-| ⌘[ / ⌘] | Focus local / SSH pane |
+| ⇧⌘R | Restart all of the current context's terminals (tmux sessions are reattached, nothing is lost) |
 
-## Theme
+### Selecting, copying and editing text
 
-Colors and font come from your Ghostty config (`~/.config/ghostty/config`, plus its `theme =` file): `background`, `foreground`, `palette` 0–15, `cursor-color`, `selection-background`, `font-family`, `font-size`. The sidebar, header and borders are derived from the same colors. Restart Helios after changing the Ghostty config.
+- **Click and drag** selects text; double-click selects a word, triple-click a line. The selection stays put while output streams in.
+- **⌘C** copies the selection. A command that Claude wrapped across several indented rows is copied as the original single line, so it pastes cleanly into a shell.
+- **⌘V** pastes as a bracketed paste, so multi-line text isn't run line by line.
+- **Scroll wheel** scrolls tmux history.
+- In the shell or Claude's prompt: **⌥← / ⌥→** jump by word, **⌥⌫** deletes a word, **⌘← / ⌘→** jump to line start/end, **⌘⌫** deletes to line start.
 
-## SSH, tmux, and reconnect
+### SSH sessions
 
-The right pane runs `ssh -t <host> tmux new-session -A -s helios-<id> [-c <remote dir>]`, so the remote shell lives in a tmux session on the server and survives disconnects, laptop sleep, and app restarts.
+The right pane runs `ssh -t <host> tmux new-session -A -s helios-<id> [-c <remote dir>]`, so the remote shell lives in tmux on the server and survives disconnects, laptop sleep and app restarts.
 
-- **Auto-reconnect:** if ssh exits with a connection error (255) or is killed, Helios retries with backoff (1, 2, 4 … 30s, up to 8 attempts) and reattaches to the same tmux session. A clean exit (you exited or detached tmux) does not reconnect; press **Reconnect**.
-- **2FA:** connections use `ControlMaster=auto` / `ControlPersist=4h` with a socket at `~/.ssh/helios-cm-%C`, so one 2FA approval is shared by every pane to that host. After a real network drop, the 2FA prompt appears in the pane.
-- If tmux isn't on the remote `PATH`, it falls back to a plain login shell (no persistence).
-- Clusters with round-robin login nodes: point the host at a specific node (e.g. `login1`) so you reattach to the node holding your tmux session.
+- **Refresh:** if an SSH pane freezes or gets stuck, click the **↻** button in the info strip (or "Reconnect SSH" in the ⌘K palette). It kills that pane's ssh and reattaches to the same tmux session.
+- **Auto-reconnect:** if ssh drops with a connection error, Helios retries with backoff (1, 2, 4 … 30s, up to 8 attempts) and reattaches. The SSH chip shows the countdown with a **now** button. A clean exit (you exited or detached tmux) doesn't reconnect; press **reconnect** on the chip.
+- **2FA once per host:** connections use `ControlMaster=auto` / `ControlPersist=4h` with a socket at `~/.ssh/helios-cm-%C`, so every pane and panel to that host shares one login. After a real network drop, the 2FA prompt appears in the pane.
+- If tmux isn't on the remote `PATH`, Helios falls back to a plain login shell (no persistence).
+- **Clusters with round-robin login nodes:** point the host at a specific node (e.g. `login1`) so you reattach to the node holding your tmux session.
 
-The **local** pane runs in a local tmux session (`helios-local-<id>`) when tmux is installed, so a running `claude` survives quitting/updating Helios. The startup command runs only when a new local session is created (first open, after a reboot, or after the shell exits); otherwise Helios reattaches. With **Resume last Claude conversation** on (default), a `claude` startup command becomes `claude --continue` when `~/.claude/projects/<dir>` has past conversations. Changing the local dir or deleting the context kills the session; editing the startup command doesn't interrupt a running one. Helios-owned tmux sessions (local and remote) set `status off` and `mouse on` per session: the wheel scrolls tmux history; **Shift+drag** selects text natively.
+### Local pane and Claude Code
 
-## Panels
+The local pane runs in a local tmux session (`helios-local-<id>`) when tmux is installed, so a running `claude` survives quitting or updating Helios.
 
-The info strip at the top of a context shows chips for the local dir, git branch (±changes, ↑↓ vs upstream), SSH status, and SLURM jobs (running / pending). Clicking a chip opens the drawer under the terminals:
+- The startup command runs only when a new session is created (first open, after a reboot, or after the shell exits); otherwise Helios reattaches.
+- With **Resume last Claude conversation** on (the default), a `claude` startup command becomes `claude --continue` when that directory has past conversations.
+- Changing the local directory or deleting the context kills its session. Editing the startup command doesn't interrupt a running one.
 
-- **Jobs** — `squeue -u $USER`, refreshed every 30s while the context is on screen. Hover a job for `gpu` (`srun --jobid --overlap nvidia-smi`), `info` (`scontrol show job`), `cancel` (`scancel`, confirmed). Toolbar: login-node GPU and disk quota (`diskusage_report` on Alliance clusters, else `quota`/`df`). Hidden on hosts without SLURM.
-- Running jobs show **tqdm progress** (bar, %, counts, ETA, rate, postfix) parsed from the tail of their StdErr/StdOut files; the jobs chip shows the first one's %.
-- **Git** — changed files and recent commits for the local dir, refreshed every 10s.
-- **Notes** — per-context scratchpad, saved with the context.
-- **Files** — browse the remote dir; double-click folders, `cd here` sends `cd` to the SSH tab, download selection into the local dir, upload via picker or drag-and-drop from Finder (rsync).
+### Drawer panels
 
-Background remote commands only run over an already-authenticated shared connection (checked locally with `ssh -O check`, then `BatchMode=yes`), so they never open new logins, prompt for 2FA, or risk failed-login lockouts. Until the SSH pane is authenticated, panels show "Not connected".
+Click a chip in the info strip to open its panel:
 
-**Local sub-tabs** sit above the left pane: the first runs the startup command (Claude), extra ones are plain shells in the project dir, each its own local tmux session. **SSH sub-tabs** sit above the right pane; each is its own tmux session (`helios-<id>-<tab>`) over the shared connection. Closing one kills its tmux session; the first tab can't be closed.
+- **Jobs**: `squeue -u $USER`, refreshed every 30s while the context is on screen. Hover a job for `gpu` (`nvidia-smi` inside the job), `info` (`scontrol show job`) or `cancel` (`scancel`, confirmed). The toolbar shows login-node GPU and disk quota. Running jobs show **tqdm progress** (bar, %, counts, ETA, rate) parsed from their output files. Hidden on hosts without SLURM.
+- **Git**: changed files and recent commits for the local directory, refreshed every 10s.
+- **Notes**: a per-context scratchpad, saved with the context.
+- **Files**: browse the remote directory. Double-click folders; `cd here` sends `cd` to the SSH pane; download the selection into the local directory; upload with the picker or by dragging from Finder (rsync).
 
-The local/remote split and the drawer height are draggable and remembered.
+Panels only run remote commands over an already-authenticated shared connection (`BatchMode=yes`), so they never open new logins, trigger 2FA prompts or risk failed-login lockouts. Until the SSH pane has logged in, they show "Not connected".
 
-## Attention
+### Attention
 
-A background context gets a pulsing sidebar badge (and the dock icon a count) when:
+A background context gets a pulsing sidebar badge (and the Dock icon a count) when:
+
 - a terminal rings the **bell** (accent badge), or
-- the local pane **went quiet** after ≥3s of continuous output, e.g. Claude finished or is waiting for input (green badge).
+- the local pane **goes quiet** after 3s or more of continuous output, e.g. Claude finished or is waiting for input (green badge).
 
-When Helios isn't the active app it also bounces the dock icon and posts a macOS notification. Badges clear when you open the context. For precise Claude signals, set Claude Code's notification channel to the terminal bell (`/config` → notifications → terminal bell).
+When Helios isn't the active app it also bounces the Dock icon and posts a notification. Badges clear when you open the context. For precise Claude signals, set Claude Code's notifications to the terminal bell (`/config` → notifications → terminal bell).
 
-## Roadmap
+### Theme
 
-Ideas: follow a full job log in the drawer; per-context hue override.
+Colors and font come from your [Ghostty](https://ghostty.org) config (`~/.config/ghostty/config` or `~/Library/Application Support/com.mitchellh.ghostty/config`, plus its `theme =` file): `background`, `foreground`, `palette` 0–15, `cursor-color`, `selection-background`, `font-family` and `font-size`. The sidebar, header and borders are derived from the same colors. Restart Helios after changing the config. Without a Ghostty config, Helios uses its built-in dark theme.
+
+## Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| SSH pane frozen or garbled | Click **↻** in the info strip to reconnect that pane. |
+| Every pane in a context is stuck | ⇧⌘R restarts the context's terminals and reattaches tmux. |
+| Panels say "Not connected" | Log in (and approve 2FA) in the SSH pane first; panels reuse that connection. |
+| Reconnected to an empty session on a cluster | Your host alias hit a different login node; pin it to one node in `~/.ssh/config`. |
+| Local pane started fresh after a reboot | Expected: tmux sessions don't survive reboots, so the startup command runs again. |
+
+## Development
+
+A Swift Package Manager project: sources are in `Sources/Helios`, tests in `Tests/HeliosTests`. Terminal emulation is [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm), pinned to 1.20.0 (1.99.x doesn't compile with Swift 6.2). `scripts/make-icon.swift` renders the app icon.
