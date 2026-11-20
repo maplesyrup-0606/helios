@@ -19,16 +19,21 @@ enum WrappedText {
         guard bodies.allSatisfy({ $0 != nil }) else { return nil }
 
         var result = String(lines[0].drop { $0 == " " })
+        var row = lines[0]
         var rowWidth = firstColumn + lines[0].count
         for case let body? in bodies {
+            let lastWord = row.reversed().prefix { $0 != " " }.count
             let nextWord = body.prefix { $0 != " " }.count
-            if rowWidth >= cols - 1 {
+            // Only a word too long for any row gets split; a shorter one moves whole to the next
+            // row. So a row reaching the edge is a split only if the two pieces can't fit one row.
+            if rowWidth >= cols - 1, lastWord + nextWord > cols - indent {
                 result += body                  // split mid-word at the pane edge
             } else if rowWidth + 1 + nextWord > cols {
                 result += " " + body            // word didn't fit, so the break replaced a space
             } else {
                 return nil                      // a real line break
             }
+            row = String(body)
             rowWidth = indent + body.count
         }
         return result

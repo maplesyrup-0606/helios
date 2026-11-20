@@ -19,6 +19,16 @@ final class WrappedTextTests: XCTestCase {
         XCTAssertEqual(WrappedText.unwrap("  " + wrapped, firstColumn: 0, cols: 74), original)
     }
 
+    // A short word that ends exactly at (or one before) the pane edge was moved, not split:
+    // joining without a space produced `--reward efficiency--mask_neighbors` and failed jobs.
+    func testWordEndingAtEdgeKeepsSpace() {
+        let first = "python train.py --reward efficiency"
+        let text = first + "\n  --mask_neighbors --seed 1"
+        let expected = "python train.py --reward efficiency --mask_neighbors --seed 1"
+        XCTAssertEqual(WrappedText.unwrap(text, firstColumn: 2, cols: 2 + first.count), expected)
+        XCTAssertEqual(WrappedText.unwrap(text, firstColumn: 2, cols: 3 + first.count), expected)
+    }
+
     func testKeepsRealLineBreaks() {
         XCTAssertNil(WrappedText.unwrap("ls\ncd foo\ngit status", firstColumn: 0, cols: 74))
         XCTAssertNil(WrappedText.unwrap("def f():\n  return 1\n  pass", firstColumn: 0, cols: 74))
