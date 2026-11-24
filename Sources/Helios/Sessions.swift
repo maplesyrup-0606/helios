@@ -166,29 +166,6 @@ enum LocalTmux {
     }
 }
 
-enum ClaudeHistory {
-    /// Claude Code stores conversations per project in ~/.claude/projects/<path with separators as '-'>.
-    static func hasConversations(in directory: String) -> Bool {
-        let path = expandTilde(directory)
-        let encoded = String(path.map { $0.isLetter || $0.isNumber ? $0 : "-" })
-        let folder = (expandTilde("~/.claude/projects") as NSString).appendingPathComponent(encoded)
-        let files = (try? FileManager.default.contentsOfDirectory(atPath: folder)) ?? []
-        return files.contains { $0.hasSuffix(".jsonl") }
-    }
-
-    /// The command to start a new session with: `claude` gains `--continue` when there is a
-    /// previous conversation to resume and the user didn't already pass a resume flag.
-    static func startupCommand(for context: WorkContext) -> String {
-        let cmd = context.startupCommand.trimmingCharacters(in: .whitespaces)
-        let words = cmd.split(separator: " ").map(String.init)
-        guard context.resumeConversation, words.first == "claude",
-              !words.contains(where: { ["--continue", "-c", "--resume", "-r"].contains($0) }),
-              hasConversations(in: context.localDir.isEmpty ? "~" : context.localDir)
-        else { return cmd }
-        return cmd + " --continue"
-    }
-}
-
 /// A local sub-tab: a login shell in the context's directory. The primary tab also runs the
 /// startup command (Claude). Lives in a local tmux session when tmux is installed, so it
 /// outlives the app.
@@ -211,7 +188,6 @@ final class LocalSession: NSObject, ObservableObject, @preconcurrency LocalProce
 
     func start() {
         let dir = expandTilde(context.localDir.isEmpty ? "~" : context.localDir)
-        let cmd = isPrimary ? ClaudeHistory.startupCommand(for: context) : ""
         isRunning = true
 
         if let tmux = LocalTmux.path {
@@ -221,6 +197,7 @@ final class LocalSession: NSObject, ObservableObject, @preconcurrency LocalProce
             // rather than typed in, since zsh startup can discard early keystrokes. When it
             // exits, the pane falls back to a normal shell.
             if LocalTmux.run(["has-session", "-t", "=" + name]) != 0 {
+                let cmd = startupCommand()
                 var args = ["new-session", "-d", "-s", name, "-c", dir]
                 if !cmd.isEmpty {
                     let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
@@ -237,12 +214,22 @@ final class LocalSession: NSObject, ObservableObject, @preconcurrency LocalProce
             return
         }
 
+        let cmd = startupCommand()
         let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
         terminal.startProcess(executable: shell, args: ["-l"], environment: terminalEnvironment(), currentDirectory: dir)
         if !cmd.isEmpty {
             // The pty buffers this until the shell is ready to read it.
             terminal.send(data: ArraySlice(Array((cmd + "\r").utf8)))
         }
+    }
+
+    /// The primary tab's startup command, pointed at the context's Claude conversation.
+    /// Records which conversation that is, so the next fresh start returns to it.
+    private func startupCommand() -> String {
+        guard isPrimary else { return "" }
+        let launch = ClaudeHistory.launch(for: context, pinned: ClaudePins.shared[context.id])
+        if let id = launch.sessionID { ClaudePins.shared[context.id] = id }
+        return launch.command
     }
 
     func stop() { if isRunning { terminal.terminate() } }
@@ -452,6 +439,15 @@ final class ContextRuntime: ObservableObject {
         let session = makeLocalSession(tab)
         localSessions[tab.id] = session
         return session
+    }
+
+    /// Replaces the primary local tab with a fresh session (killing its tmux session), so the
+    /// startup command runs again, e.g. to open a different Claude conversation.
+    func restartPrimaryLocal() {
+        guard let tab = context.localTabs.first else { return }
+        localSessions[tab.id]?.stop()
+        LocalTmux.kill(session: context.localTmuxSession(for: tab))
+        localSessions[tab.id] = makeLocalSession(tab)
     }
 
     /// Which pane a terminal view belongs to, if any.

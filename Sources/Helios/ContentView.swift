@@ -378,6 +378,8 @@ private struct LocalPane: View {
                         TerminalSurface(view: session.terminal, isVisible: visible)
                             .opacity(visible ? 1 : 0)
                             .allowsHitTesting(visible)
+                            // A restarted tab gets a new session; give it a fresh host.
+                            .id(ObjectIdentifier(session))
                     }
                 }
             }
@@ -951,6 +953,19 @@ private struct ContextEditor: View {
     @State var draft: WorkContext
     let isNew: Bool
     private let knownHosts = SSHConfig.hosts()
+    /// Conversations in the draft's folder, newest first, for the picker.
+    @State private var conversations: [ClaudeHistory.Conversation] = []
+    /// The pinned conversation when the editor opened, and the one picked now.
+    @State private var originalConversation: String?
+    @State private var conversation: String?
+
+    init(draft: WorkContext, isNew: Bool) {
+        _draft = State(initialValue: draft)
+        self.isNew = isNew
+        let pinned = isNew ? nil : ClaudePins.shared[draft.id]
+        _originalConversation = State(initialValue: pinned)
+        _conversation = State(initialValue: pinned)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -963,8 +978,22 @@ private struct ContextEditor: View {
                         Button("Choose…", action: chooseDirectory)
                     }
                     TextField("Startup command", text: $draft.startupCommand, prompt: Text("claude"))
-                    Toggle("Resume last Claude conversation", isOn: $draft.resumeConversation)
-                    Text("The startup command runs only when Helios creates a new local session (first open, after a reboot, or after the shell exits). Otherwise Helios reattaches to what's already running. With resume on, `claude` becomes `claude --continue` when this folder has past conversations.")
+                    Toggle("Resume this context's Claude conversation", isOn: $draft.resumeConversation)
+                    if draft.resumeConversation {
+                        Picker("Conversation", selection: $conversation) {
+                            if originalConversation == nil {
+                                Text("Most recent in this folder").tag(String?.none)
+                            } else if !conversations.contains(where: { $0.id == originalConversation }) {
+                                Text("Current (no messages yet)").tag(originalConversation)
+                            }
+                            ForEach(conversations) { c in
+                                Text(conversationLabel(c)).tag(Optional(c.id))
+                            }
+                            Divider()
+                            Text("New conversation").tag(Optional(Self.newConversation))
+                        }
+                    }
+                    Text(startupFootnote)
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -992,7 +1021,7 @@ private struct ContextEditor: View {
                 }
                 Spacer()
                 Button("Cancel") { model.editing = nil }.keyboardShortcut(.cancelAction)
-                Button(isNew ? "Create" : "Save") { model.commit(draft) }
+                Button(isNew ? "Create" : "Save") { save() }
                     .keyboardShortcut(.defaultAction)
                     .disabled(draft.name.trimmingCharacters(in: .whitespaces).isEmpty)
             }
@@ -1000,6 +1029,51 @@ private struct ContextEditor: View {
         .padding(20)
         .frame(width: 520)
         .background(theme.canvas)
+        .task(id: draft.localDir) { await loadConversations() }
+    }
+
+    private static let newConversation = "new"
+
+    private var conversationChanged: Bool {
+        draft.resumeConversation && conversation != originalConversation
+    }
+
+    private var startupFootnote: String {
+        if conversationChanged && !isNew {
+            return "Saving restarts the Claude tab in the chosen conversation."
+        }
+        return "The startup command runs only when Helios creates a new local session (first open, after a reboot, or after the shell exits). Otherwise Helios reattaches to what's already running. With resume on, a plain `claude` reopens this context's conversation, which Helios follows as it changes (including /resume inside the tab)."
+    }
+
+    private func conversationLabel(_ c: ClaudeHistory.Conversation) -> String {
+        let when = c.modified.formatted(.relative(presentation: .named))
+        return (c.title.isEmpty ? String(c.id.prefix(8)) : c.title) + " · " + when
+    }
+
+    private func loadConversations() async {
+        let dir = draft.localDir
+        let loaded = await Task.detached(priority: .userInitiated) {
+            ClaudeHistory.conversations(in: dir).prefix(30).map { c -> ClaudeHistory.Conversation in
+                var c = c
+                c.title = ClaudeHistory.title(of: c.id, in: dir)
+                return c
+            }
+        }.value
+        guard dir == draft.localDir else { return }
+        conversations = loaded
+        // A different folder has different conversations; the pin no longer applies there.
+        if !isNew, dir != model.contexts.first(where: { $0.id == draft.id })?.localDir {
+            originalConversation = nil
+            if conversation != Self.newConversation { conversation = nil }
+        }
+    }
+
+    private func save() {
+        var choice: String?
+        if conversationChanged, let picked = conversation {
+            choice = picked == Self.newConversation ? UUID().uuidString.lowercased() : picked
+        }
+        model.commit(draft, conversation: choice)
     }
 
     private func chooseDirectory() {

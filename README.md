@@ -107,7 +107,7 @@ The right pane runs `ssh -t <host> tmux new-session -A -s helios-<id> [-c <remot
 The local pane runs in a local tmux session (`helios-local-<id>`) when tmux is installed, so a running `claude` survives quitting or updating Helios.
 
 - The startup command runs only when a new session is created (first open, after a reboot, or after the shell exits); otherwise Helios reattaches.
-- With **Resume last Claude conversation** on (the default), a `claude` startup command becomes `claude --continue` when that directory has past conversations.
+- With **Resume this context's Claude conversation** on (the default), a `claude` startup command reopens the conversation that context's Claude tab was last in (`claude --resume <id>`), even if you've since run `claude` in the same folder elsewhere. Helios follows the tab's conversation while it runs (including `/resume` inside it) via Claude Code's `~/.claude/sessions` registry and saves it in `~/Library/Application Support/Helios/claude-sessions.json`. Pick a different conversation, or a new one, from the **Conversation** menu in the context's settings; saving restarts the Claude tab in it.
 - Changing the local directory or deleting the context kills its session. Editing the startup command doesn't interrupt a running one.
 
 ### Drawer panels

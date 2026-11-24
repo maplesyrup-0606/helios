@@ -36,9 +36,20 @@ final class AppModel: ObservableObject {
     /// Open drawer tab under the terminals; nil when the drawer is closed.
     @Published var drawerTab: DrawerTab?
     private var runtimes: [UUID: ContextRuntime] = [:]
+    private var claudeSync: Timer?
 
     init() {
         selectedID = store.contexts.first?.id
+        // Track which conversation each Claude tab is in, so a fresh start (after a reboot)
+        // resumes that one. Runs before any session starts, while old tmux sessions still hold
+        // their Claude.
+        ClaudePins.shared.sync(store.contexts)
+        claudeSync = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                ClaudePins.shared.sync(self.store.contexts)
+            }
+        }
         // Observers don't fire during init; start the first context once the app is running.
         DispatchQueue.main.async { [weak self] in
             if let id = self?.selectedID { self?.ensureRuntime(for: id) }
@@ -90,11 +101,17 @@ final class AppModel: ObservableObject {
         editing = selected
     }
 
-    func commit(_ context: WorkContext) {
+    /// Saves an edited context. `conversation`, when given, is the Claude conversation the
+    /// primary local tab should be in; a change restarts that tab into it.
+    func commit(_ context: WorkContext, conversation: String? = nil) {
         objectWillChange.send()
         if let index = store.contexts.firstIndex(where: { $0.id == context.id }) {
             let old = store.contexts[index]
             store.contexts[index] = context
+            // Conversations belong to a folder, so a new folder starts without a pin.
+            if old.localDir != context.localDir { ClaudePins.shared[context.id] = nil }
+            let switchConversation = conversation.map { $0 != ClaudePins.shared[context.id] } ?? false
+            if let conversation { ClaudePins.shared[context.id] = conversation }
             // Restart terminals only when something they were launched with changed.
             // The startup command only applies to newly created sessions, so editing it never
             // interrupts a running one. A new local dir needs a fresh local tmux session.
@@ -106,8 +123,10 @@ final class AppModel: ObservableObject {
                 restart(context.id)
             } else {
                 runtimes[context.id]?.update(context)
+                if switchConversation { restartClaude(context) }
             }
         } else {
+            if let conversation { ClaudePins.shared[context.id] = conversation }
             store.contexts.append(context)
         }
         selectedID = context.id
@@ -118,6 +137,7 @@ final class AppModel: ObservableObject {
         objectWillChange.send()
         runtimes.removeValue(forKey: id)?.shutdown()
         if let context = store.contexts.first(where: { $0.id == id }) { LocalTmux.kill(context) }
+        ClaudePins.shared[id] = nil
         clearAttention(id)
         store.contexts.removeAll { $0.id == id }
         if selectedID == id { selectedID = store.contexts.first?.id }
@@ -128,6 +148,16 @@ final class AppModel: ObservableObject {
         objectWillChange.send()
         runtimes.removeValue(forKey: id)?.shutdown()
         if id == selectedID { ensureRuntime(for: id) }
+    }
+
+    /// Restarts the primary local tab so Claude opens the pinned conversation. Without a
+    /// runtime, the leftover tmux session is killed so the next open starts fresh.
+    private func restartClaude(_ context: WorkContext) {
+        if let runtime = runtimes[context.id] {
+            runtime.restartPrimaryLocal()
+        } else if let tab = context.localTabs.first {
+            LocalTmux.kill(session: context.localTmuxSession(for: tab))
+        }
     }
 
     func restartSelected() {

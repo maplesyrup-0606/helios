@@ -52,23 +52,95 @@ final class ProgressCommandTests: XCTestCase {
 }
 
 final class ClaudeHistoryTests: XCTestCase {
-    func testAddsContinueOnlyForPlainClaudeWithHistory() {
-        var ctx = WorkContext(name: "t", localDir: "/nonexistent/helios-test-dir")
-        // No history for a nonexistent dir: unchanged.
-        XCTAssertEqual(ClaudeHistory.startupCommand(for: ctx), "claude")
-        ctx.startupCommand = "claude --resume abc"
-        XCTAssertEqual(ClaudeHistory.startupCommand(for: ctx), "claude --resume abc")
-        ctx.startupCommand = "htop"
-        XCTAssertEqual(ClaudeHistory.startupCommand(for: ctx), "htop")
+    private var root: String!
+    private let dir = "/tmp/helios-test-project"
+
+    override func setUpWithError() throws {
+        root = NSTemporaryDirectory() + "helios-claude-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
     }
 
-    func testRealProjectWithHistoryGetsContinue() throws {
-        let dir = "~/Documents/Projects/ELVIS"
-        try XCTSkipUnless(ClaudeHistory.hasConversations(in: dir), "no local Claude history for ELVIS")
-        var ctx = WorkContext(name: "elvis", localDir: dir)
-        XCTAssertEqual(ClaudeHistory.startupCommand(for: ctx), "claude --continue")
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(atPath: root)
+    }
+
+    private func writeTranscript(_ id: String, _ lines: [String] = [], modified: Date = Date()) throws {
+        let folder = ClaudeHistory.projectFolder(for: dir, root: root)
+        try FileManager.default.createDirectory(atPath: folder, withIntermediateDirectories: true)
+        let path = folder + "/" + id + ".jsonl"
+        try lines.joined(separator: "\n").write(toFile: path, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.modificationDate: modified], ofItemAtPath: path)
+    }
+
+    func testCommandsWithTheirOwnResumeChoiceAreLeftAlone() {
+        var ctx = WorkContext(name: "t", localDir: dir)
+        for cmd in ["claude --resume abc", "claude -c", "claude --session-id=x", "htop"] {
+            ctx.startupCommand = cmd
+            XCTAssertEqual(ClaudeHistory.launch(for: ctx, pinned: nil, root: root).command, cmd)
+            XCTAssertNil(ClaudeHistory.launch(for: ctx, pinned: nil, root: root).sessionID)
+        }
+        ctx.startupCommand = "claude"
         ctx.resumeConversation = false
-        XCTAssertEqual(ClaudeHistory.startupCommand(for: ctx), "claude")
+        XCTAssertEqual(ClaudeHistory.launch(for: ctx, pinned: "5b0c3e43-1111-4222-8333-944455556666", root: root).command, "claude")
+    }
+
+    func testPinnedConversationIsResumedEvenWhenNotNewest() throws {
+        let pinned = "5b0c3e43-1111-4222-8333-944455556666"
+        let newer = "9f1d2a7e-aaaa-4bbb-8ccc-dddddddddddd"
+        try writeTranscript(pinned, modified: Date(timeIntervalSinceNow: -3600))
+        try writeTranscript(newer)
+        let ctx = WorkContext(name: "t", localDir: dir)
+        let launch = ClaudeHistory.launch(for: ctx, pinned: pinned, root: root)
+        XCTAssertEqual(launch.command, "claude --resume " + pinned)
+        XCTAssertEqual(launch.sessionID, pinned)
+    }
+
+    func testPinWithoutTranscriptStartsThatID() {
+        let pinned = "5b0c3e43-1111-4222-8333-944455556666"
+        let launch = ClaudeHistory.launch(for: WorkContext(name: "t", localDir: dir), pinned: pinned, root: root)
+        XCTAssertEqual(launch.command, "claude --session-id " + pinned)
+    }
+
+    func testNoPinAdoptsNewestOrMintsOne() throws {
+        let ctx = WorkContext(name: "t", localDir: dir)
+        let fresh = ClaudeHistory.launch(for: ctx, pinned: nil, root: root)
+        XCTAssertTrue(fresh.command.hasPrefix("claude --session-id "))
+        XCTAssertTrue(ClaudeHistory.isUUID(fresh.sessionID ?? ""))
+
+        let old = "5b0c3e43-1111-4222-8333-944455556666"
+        let newest = "9f1d2a7e-aaaa-4bbb-8ccc-dddddddddddd"
+        try writeTranscript(old, modified: Date(timeIntervalSinceNow: -3600))
+        try writeTranscript(newest)
+        XCTAssertEqual(ClaudeHistory.launch(for: ctx, pinned: nil, root: root).command, "claude --resume " + newest)
+    }
+
+    func testTitlePrefersRenameThenGeneratedThenFirstPrompt() throws {
+        let a = "5b0c3e43-1111-4222-8333-944455556666"
+        try writeTranscript(a, [
+            #"{"type":"user","message":{"role":"user","content":"fix the branch chip"}}"#,
+            #"{"type":"ai-title","aiTitle":"Branch chip fix"}"#,
+        ])
+        XCTAssertEqual(ClaudeHistory.title(of: a, in: dir, root: root), "Branch chip fix")
+        try writeTranscript(a, [
+            #"{"type":"ai-title","aiTitle":"Branch chip fix"}"#,
+            #"{"type":"custom-title","customTitle":"my name"}"#,
+        ])
+        XCTAssertEqual(ClaudeHistory.title(of: a, in: dir, root: root), "my name")
+        try writeTranscript(a, [#"{"type":"user","message":{"role":"user","content":"hello there"}}"#])
+        XCTAssertEqual(ClaudeHistory.title(of: a, in: dir, root: root), "hello there")
+    }
+
+    func testLiveSessionMatchesTmuxSessionOfALiveProcess() throws {
+        let registry = root + "/sessions"
+        try FileManager.default.createDirectory(atPath: registry, withIntermediateDirectories: true)
+        let live = "5b0c3e43-1111-4222-8333-944455556666"
+        try #"{"pid":\#(getpid()),"sessionId":"\#(live)","tmux":"helios-local-ab12cd34:@0.%0","updatedAt":2}"#
+            .write(toFile: registry + "/1.json", atomically: true, encoding: .utf8)
+        // A dead process and a different tab's session are ignored.
+        try #"{"pid":999999,"sessionId":"9f1d2a7e-aaaa-4bbb-8ccc-dddddddddddd","tmux":"helios-local-ab12cd34:@0.%0","updatedAt":3}"#
+            .write(toFile: registry + "/2.json", atomically: true, encoding: .utf8)
+        XCTAssertEqual(ClaudeHistory.liveSessionID(tmuxSession: "helios-local-ab12cd34", registryDir: registry), live)
+        XCTAssertNil(ClaudeHistory.liveSessionID(tmuxSession: "helios-local-ab12cd34-1a2b", registryDir: registry))
     }
 }
 
