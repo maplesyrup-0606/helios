@@ -39,20 +39,40 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleVersion</key><string>1</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>NSHighResolutionCapable</key><true/>
+    <key>NSDesktopFolderUsageDescription</key><string>Programs you run in Helios's terminals (like Claude Code) read and write files on your Desktop.</string>
+    <key>NSDocumentsFolderUsageDescription</key><string>Programs you run in Helios's terminals (like Claude Code) read and write files in Documents.</string>
+    <key>NSDownloadsFolderUsageDescription</key><string>Programs you run in Helios's terminals (like Claude Code) read and write files in Downloads.</string>
+    <key>NSRemovableVolumesUsageDescription</key><string>Programs you run in Helios's terminals read and write files on external drives.</string>
+    <key>NSNetworkVolumesUsageDescription</key><string>Programs you run in Helios's terminals read and write files on network volumes.</string>
 </dict>
 </plist>
 PLIST
 
-# Ad-hoc signature so Gatekeeper lets a locally built app run. codesign rejects
-# extended attributes (Finder info etc.) that sips/iconutil can leave behind.
-xattr -cr "$APP"
-codesign --force --sign - "$APP"
+# Sign with the local "Helios Local Signing" certificate when present (see
+# scripts/make-signing-cert.sh): macOS keys privacy grants such as Full Disk Access to the
+# signature, so a stable identity keeps them across rebuilds. Otherwise fall back to an
+# ad-hoc signature, whose grants reset on every build. codesign rejects extended attributes
+# (Finder info etc.) that sips/iconutil can leave behind.
+# Sign a copy outside the project: when it lives in an iCloud-synced folder, the sync
+# re-adds Finder info to the bundle between xattr and codesign.
+SIGN_DIR="$(mktemp -d)"; trap 'rm -rf "$SIGN_DIR"' EXIT
+ditto --norsrc --noextattr "$APP" "$SIGN_DIR/Helios.app"
+xattr -cr "$SIGN_DIR/Helios.app"
+IDENTITY="Helios Local Signing"
+if security find-identity -v -p codesigning 2>/dev/null | grep -q "\"$IDENTITY\""; then
+    codesign --force --sign "$IDENTITY" "$SIGN_DIR/Helios.app"
+else
+    echo "note: no '$IDENTITY' certificate; ad-hoc signing (privacy grants reset each build)" >&2
+    codesign --force --sign - "$SIGN_DIR/Helios.app"
+fi
+rm -rf "$APP"
+ditto "$SIGN_DIR/Helios.app" "$APP"
 echo "Built $APP"
 
 if [[ "${1:-}" == "--install" ]]; then
     # Replace the installed copy in place (ditto preserves the signature and metadata).
     rm -rf /Applications/Helios.app
-    ditto "$APP" /Applications/Helios.app
+    ditto "$SIGN_DIR/Helios.app" /Applications/Helios.app
     # Nudge Finder/Dock to pick up the new icon.
     touch /Applications/Helios.app
     echo "Installed to /Applications/Helios.app"
