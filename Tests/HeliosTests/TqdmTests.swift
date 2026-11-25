@@ -73,15 +73,16 @@ final class ClaudeHistoryTests: XCTestCase {
     }
 
     func testCommandsWithTheirOwnResumeChoiceAreLeftAlone() {
-        var ctx = WorkContext(name: "t", localDir: dir)
+        var pane = WorkContext(name: "t", localDir: dir).left
         for cmd in ["claude --resume abc", "claude -c", "claude --session-id=x", "htop"] {
-            ctx.startupCommand = cmd
-            XCTAssertEqual(ClaudeHistory.launch(for: ctx, pinned: nil, root: root).command, cmd)
-            XCTAssertNil(ClaudeHistory.launch(for: ctx, pinned: nil, root: root).sessionID)
+            pane.startupCommand = cmd
+            XCTAssertEqual(ClaudeHistory.launch(for: pane, pinned: nil, root: root).command, cmd)
+            XCTAssertNil(ClaudeHistory.launch(for: pane, pinned: nil, root: root).sessionID)
+            XCTAssertEqual(ClaudeHistory.remoteLaunch(for: pane, pinned: nil).command, cmd)
         }
-        ctx.startupCommand = "claude"
-        ctx.resumeConversation = false
-        XCTAssertEqual(ClaudeHistory.launch(for: ctx, pinned: "5b0c3e43-1111-4222-8333-944455556666", root: root).command, "claude")
+        pane.startupCommand = "claude"
+        pane.resumeConversation = false
+        XCTAssertEqual(ClaudeHistory.launch(for: pane, pinned: "5b0c3e43-1111-4222-8333-944455556666", root: root).command, "claude")
     }
 
     func testPinnedConversationIsResumedEvenWhenNotNewest() throws {
@@ -89,7 +90,7 @@ final class ClaudeHistoryTests: XCTestCase {
         let newer = "9f1d2a7e-aaaa-4bbb-8ccc-dddddddddddd"
         try writeTranscript(pinned, modified: Date(timeIntervalSinceNow: -3600))
         try writeTranscript(newer)
-        let ctx = WorkContext(name: "t", localDir: dir)
+        let ctx = WorkContext(name: "t", localDir: dir).left
         let launch = ClaudeHistory.launch(for: ctx, pinned: pinned, root: root)
         XCTAssertEqual(launch.command, "claude --resume " + pinned)
         XCTAssertEqual(launch.sessionID, pinned)
@@ -97,12 +98,12 @@ final class ClaudeHistoryTests: XCTestCase {
 
     func testPinWithoutTranscriptStartsThatID() {
         let pinned = "5b0c3e43-1111-4222-8333-944455556666"
-        let launch = ClaudeHistory.launch(for: WorkContext(name: "t", localDir: dir), pinned: pinned, root: root)
+        let launch = ClaudeHistory.launch(for: WorkContext(name: "t", localDir: dir).left, pinned: pinned, root: root)
         XCTAssertEqual(launch.command, "claude --session-id " + pinned)
     }
 
     func testNoPinAdoptsNewestOrMintsOne() throws {
-        let ctx = WorkContext(name: "t", localDir: dir)
+        let ctx = WorkContext(name: "t", localDir: dir).left
         let fresh = ClaudeHistory.launch(for: ctx, pinned: nil, root: root)
         XCTAssertTrue(fresh.command.hasPrefix("claude --session-id "))
         XCTAssertTrue(ClaudeHistory.isUUID(fresh.sessionID ?? ""))
@@ -144,21 +145,129 @@ final class ClaudeHistoryTests: XCTestCase {
     }
 }
 
-final class LocalTabTests: XCTestCase {
+final class PaneConfigTests: XCTestCase {
     func testPrimaryLocalTabKeepsLegacySessionName() throws {
         // A context saved before local sub-tabs existed (no "localTabs" key).
         let json = #"{"id":"EA351623-9A5F-422E-A240-545338666EAB","name":"geodesic","localDir":"~/x","startupCommand":"claude"}"#
         let ctx = try JSONDecoder().decode(WorkContext.self, from: Data(json.utf8))
-        XCTAssertEqual(ctx.localTabs.count, 1)
-        XCTAssertEqual(ctx.localTabs[0].name, "claude")
-        XCTAssertEqual(ctx.localTmuxSession(for: ctx.localTabs[0]), "helios-local-ea351623")
+        XCTAssertEqual(ctx.left.tabs.count, 1)
+        XCTAssertEqual(ctx.left.tabs[0].name, "claude")
+        XCTAssertEqual(ctx.tmuxSession(.left, for: ctx.left.tabs[0]), "helios-local-ea351623")
+        XCTAssertEqual(ctx.right.kind, .ssh)
+        XCTAssertFalse(ctx.right.hasTerminal)
     }
 
-    func testExtraLocalTabsGetDistinctSessions() {
+    func testFixedLayoutContextMigratesToPanes() throws {
+        let json = #"""
+        {"id":"EA351623-9A5F-422E-A240-545338666EAB","name":"g","localDir":"~/x","startupCommand":"claude",
+         "resumeConversation":false,"host":"fir","remoteDir":"~/scratch/g",
+         "localTabs":[{"id":"11111111-1111-4111-8111-111111111111","name":"claude"}],
+         "remoteTabs":[{"id":"22222222-2222-4222-8222-222222222222","name":"main"}]}
+        """#
+        let ctx = try JSONDecoder().decode(WorkContext.self, from: Data(json.utf8))
+        XCTAssertEqual(ctx.left, PaneConfig(kind: .local, dir: "~/x", startupCommand: "claude", resumeConversation: false,
+                                            tabs: [PaneTab(id: UUID(uuidString: "11111111-1111-4111-8111-111111111111")!, name: "claude")]))
+        XCTAssertEqual(ctx.right.kind, .ssh)
+        XCTAssertEqual(ctx.right.host, "fir")
+        XCTAssertEqual(ctx.right.dir, "~/scratch/g")
+        XCTAssertEqual(ctx.right.startupCommand, "")
+        XCTAssertEqual(ctx.tmuxSession(.right, for: ctx.right.tabs[0]), "helios-ea351623")
+        XCTAssertEqual(ctx.host, "fir")
+        XCTAssertEqual(ctx.localDir, "~/x")
+
+        // Saved again in the new format, it reads back the same.
+        let again = try JSONDecoder().decode(WorkContext.self, from: JSONEncoder().encode(ctx))
+        XCTAssertEqual(again, ctx)
+    }
+
+    func testEitherPaneCanBeAnywhere() {
         var ctx = WorkContext(name: "t", localDir: "~")
-        ctx.localTabs.append(PaneTab(name: "shell 2"))
-        let names = Set(ctx.localTabs.map { ctx.localTmuxSession(for: $0) })
-        XCTAssertEqual(names.count, 2)
-        XCTAssertTrue(names.allSatisfy { $0.hasPrefix("helios-local-") })
+        ctx.left = PaneConfig(kind: .ssh, host: "mini", dir: "~/proj", startupCommand: "claude")
+        ctx.right = PaneConfig(kind: .ssh, host: "fir")
+        XCTAssertEqual(ctx.sshSides, [.right, .left])
+        XCTAssertEqual(ctx.host, "fir")
+        XCTAssertNil(ctx.localDir)
+        XCTAssertEqual(ctx.summary, "mini · fir")
+        ctx.right = PaneConfig(kind: .none)
+        XCTAssertEqual(ctx.host, "mini")
+        XCTAssertEqual(ctx.remoteDir, "~/proj")
+        XCTAssertEqual(ctx.side(of: ctx.left.tabs[0].id), .left)
+    }
+
+    func testTabsGetDistinctSessionsAcrossPanes() {
+        var ctx = WorkContext(name: "t", localDir: "~")
+        ctx.left.tabs.append(PaneTab(name: "shell 2"))
+        ctx.right.tabs.append(PaneTab(name: "shell 2"))
+        let names = Set(PaneSide.allCases.flatMap { side in ctx[side].tabs.map { ctx.tmuxSession(side, for: $0) } })
+        XCTAssertEqual(names.count, 4)
+    }
+}
+
+final class RemoteClaudeLaunchTests: XCTestCase {
+    private var home: String!
+    private var project: String!
+
+    override func setUpWithError() throws {
+        home = NSTemporaryDirectory() + "helios-home-" + UUID().uuidString
+        project = home + "/proj"
+        try FileManager.default.createDirectory(atPath: project, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(atPath: home)
+    }
+
+    /// Runs the generated remote script in /bin/sh with `claude` stubbed to echo its arguments.
+    private func run(_ script: String) async -> String {
+        let result = await Shell.run("/bin/sh", ["-c", #"claude() { echo "$@"; }; "# + script, ], cwd: project)
+        return result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func transcriptFolder() throws -> String {
+        // Foundation's symlink resolution drops /private on macOS; the shell's `pwd -P` doesn't.
+        let physical = String(cString: realpath(project, nil))
+        let folder = home + "/.claude/projects/" + String(physical.map { $0.isLetter || $0.isNumber ? $0 : "-" })
+        try FileManager.default.createDirectory(atPath: folder, withIntermediateDirectories: true)
+        return folder
+    }
+
+    private func script(pinned: String?) -> String {
+        let pane = PaneConfig(kind: .ssh, host: "h", dir: project, startupCommand: "claude")
+        // HOME is the remote one; point it at the fixture.
+        return "HOME=" + shellQuote(home) + "; " + ClaudeHistory.remoteLaunch(for: pane, pinned: pinned).command
+    }
+
+    func testPinnedResumesWhenTranscriptExistsOnHost() async throws {
+        let id = "5b0c3e43-1111-4222-8333-944455556666"
+        let out1 = await run(script(pinned: id))
+        XCTAssertEqual(out1, "--session-id " + id)
+        FileManager.default.createFile(atPath: try transcriptFolder() + "/" + id + ".jsonl", contents: Data())
+        let out2 = await run(script(pinned: id))
+        XCTAssertEqual(out2, "--resume " + id)
+    }
+
+    func testNoPinAdoptsNewestOnHost() async throws {
+        let fresh = await run(script(pinned: nil))
+        XCTAssertTrue(fresh.hasPrefix("--session-id "))
+        let folder = try transcriptFolder()
+        let old = "5b0c3e43-1111-4222-8333-944455556666", newest = "9f1d2a7e-aaaa-4bbb-8ccc-dddddddddddd"
+        FileManager.default.createFile(atPath: folder + "/" + old + ".jsonl", contents: Data())
+        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -3600)],
+                                              ofItemAtPath: folder + "/" + old + ".jsonl")
+        FileManager.default.createFile(atPath: folder + "/" + newest + ".jsonl", contents: Data())
+        FileManager.default.createFile(atPath: folder + "/notes.jsonl", contents: Data())
+        let out = await run(script(pinned: nil))
+        XCTAssertEqual(out, "--resume " + newest)
+    }
+
+    func testRegistryLinesMatchTmuxSession() {
+        let output = """
+        {"pid":1,"sessionId":"5b0c3e43-1111-4222-8333-944455556666","tmux":"helios-local-ea351623:@0.%0","updatedAt":5}
+        {"pid":2,"sessionId":"9f1d2a7e-aaaa-4bbb-8ccc-dddddddddddd","tmux":"helios-ea351623:@0.%0","updatedAt":9}
+        """
+        let entries = ClaudeHistory.registryEntries(fromLines: output)
+        XCTAssertEqual(ClaudeHistory.liveSessionID(tmuxSession: "helios-ea351623", entries: entries),
+                       "9f1d2a7e-aaaa-4bbb-8ccc-dddddddddddd")
+        XCTAssertNil(ClaudeHistory.liveSessionID(tmuxSession: "helios-other", entries: entries))
     }
 }

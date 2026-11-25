@@ -54,11 +54,12 @@ struct ContentView: View {
                 .keyboardShortcut(.defaultAction)
             Button("Cancel", role: .cancel) {
                 model.closingTab = nil
-                model.focusPane(remote: closing.side == .remote)
+                model.focusPane(closing.side)
             }
         } message: { closing in
-            Text(closing.side == .remote
-                 ? "This ends its tmux session on \(model.selected?.host ?? "the host") and anything running in it."
+            let pane = model.selected?[closing.side]
+            Text(pane?.isSSH == true
+                 ? "This ends its tmux session on \(pane?.trimmedHost ?? "the host") and anything running in it."
                  : "This ends its local tmux session and anything running in it.")
         }
         .sheet(item: $model.editing) { context in
@@ -136,7 +137,7 @@ private struct SidebarRow: View {
     @State private var isHovered = false
 
     private var subtitle: String {
-        context.host.isEmpty ? context.localDir : context.host
+        context.summary
     }
 
     var body: some View {
@@ -213,7 +214,7 @@ private struct AttentionBadge: View {
 /// Rounded initial in the context's hue, with an SSH status dot in the corner.
 struct Monogram: View {
     let context: WorkContext
-    let ssh: SSHSession?
+    let ssh: TerminalSession?
     let size: CGFloat
 
     var body: some View {
@@ -238,7 +239,7 @@ struct Monogram: View {
 
 /// SSH health: hollow until the tab has been opened.
 private struct StatusDot: View {
-    let ssh: SSHSession?
+    let ssh: TerminalSession?
 
     var body: some View {
         if let ssh {
@@ -249,7 +250,7 @@ private struct StatusDot: View {
     }
 
     private struct LiveDot: View {
-        @ObservedObject var session: SSHSession
+        @ObservedObject var session: TerminalSession
         var body: some View {
             let color = color(for: session.state)
             Circle()
@@ -268,7 +269,7 @@ private struct StatusDot: View {
     }
 }
 
-private func color(for state: SSHSession.State) -> Color {
+private func color(for state: TerminalSession.State) -> Color {
     switch state {
     case .running: theme.ok
     case .waiting: theme.warn
@@ -334,88 +335,61 @@ private struct ContextDetail: View {
         .onDisappear { runtime.setActive(false) }
     }
 
-    /// Polling runs only for the visible context; becoming visible puts the cursor in its local pane.
+    /// Polling runs only for the visible context; becoming visible puts the cursor in its left pane.
     private func activate(_ active: Bool) {
         runtime.setActive(active)
-        if active, let local = runtime.visibleLocal { FocusTracker.shared.request(local.terminal) }
+        guard active else { return }
+        let side: PaneSide = context.left.hasTerminal ? .left : .right
+        if let session = runtime.visible(side) { FocusTracker.shared.request(session.terminal) }
     }
 
     private var panes: some View {
         ResizableSplit(axis: .horizontal, ratio: context.splitRatio,
                        onCommit: { ratio in model.update(context.id) { $0.splitRatio = ratio } }) {
-            LocalPane(context: context, runtime: runtime, isActive: isActive)
+            PaneView(side: .left, context: context, runtime: runtime, isActive: isActive)
         } second: {
-            RemotePane(context: context, runtime: runtime, isActive: isActive)
+            PaneView(side: .right, context: context, runtime: runtime, isActive: isActive)
         }
     }
 
+    /// Types into the shell of the pane on the file browser's host.
     private func sendToSSH(_ text: String) {
-        guard let session = runtime.visibleSSH else { return }
+        guard let side = context.primarySSHSide, let session = runtime.visible(side) else { return }
         session.terminal.send(data: ArraySlice(Array(text.utf8)))
         FocusTracker.shared.request(session.terminal)
     }
 }
 
-private struct LocalPane: View {
-    let context: WorkContext
-    @ObservedObject var runtime: ContextRuntime
-    let isActive: Bool
-    @ObservedObject private var focus = FocusTracker.shared
-
-    private var selectedTab: PaneTab? {
-        context.localTabs.first { $0.id == runtime.selectedLocalTab } ?? context.localTabs.first
-    }
-
-    var body: some View {
-        Card(isFocused: runtime.visibleLocal.map { focus.isFocused($0.terminal) } ?? false) {
-            PaneTabStrip(side: .local, context: context, runtime: runtime)
-        } content: {
-            // Every opened sub-tab stays mounted; switching only changes which is visible.
-            ZStack {
-                ForEach(context.localTabs) { tab in
-                    if let session = runtime.localSessions[tab.id] {
-                        let visible = isActive && tab.id == selectedTab?.id
-                        TerminalSurface(view: session.terminal, isVisible: visible)
-                            .opacity(visible ? 1 : 0)
-                            .allowsHitTesting(visible)
-                            // A restarted tab gets a new session; give it a fresh host.
-                            .id(ObjectIdentifier(session))
-                    }
-                }
-            }
-            .onAppear {
-                // A saved sub-tab starts the first time it's shown (outside view updates).
-                if let tab = selectedTab, runtime.localSessions[tab.id] == nil { _ = runtime.localSession(for: tab) }
-            }
-        }
-    }
-}
-
-/// Right side: SSH sub-tabs in the card header plus the selected sub-tab's terminal.
-private struct RemotePane: View {
+/// One pane: its sub-tabs in the card header plus the selected sub-tab's terminal, wherever it runs.
+private struct PaneView: View {
     @EnvironmentObject private var model: AppModel
+    let side: PaneSide
     let context: WorkContext
     @ObservedObject var runtime: ContextRuntime
     let isActive: Bool
     @ObservedObject private var focus = FocusTracker.shared
 
+    private var pane: PaneConfig { context[side] }
+
     private var selectedTab: PaneTab? {
-        context.remoteTabs.first { $0.id == runtime.selectedRemoteTab } ?? context.remoteTabs.first
+        pane.tabs.first { $0.id == runtime.selectedTab(side) } ?? pane.tabs.first
     }
 
     var body: some View {
-        if !context.hasHost {
+        if !pane.hasTerminal {
             Card {
                 HStack {
-                    Image(systemName: "network.slash").font(.system(size: 10)).foregroundStyle(theme.textFaint)
-                    Text("remote").font(.system(size: 11, weight: .semibold)).foregroundStyle(theme.textMuted)
+                    Image(systemName: pane.kind == .ssh ? "network.slash" : "rectangle.dashed")
+                        .font(.system(size: 10)).foregroundStyle(theme.textFaint)
+                    Text(side.label.lowercased()).font(.system(size: 11, weight: .semibold)).foregroundStyle(theme.textMuted)
                     Spacer()
                 }
                 .padding(.horizontal, 12)
             } content: {
                 VStack(spacing: 8) {
-                    Text("No SSH host").font(.system(size: 13, weight: .medium)).foregroundStyle(theme.textMuted)
-                    Button("Add one  ⇧⌘E") { model.beginEditSelected() }
+                    Text(pane.kind == .ssh ? "No SSH host" : "No terminal")
+                        .font(.system(size: 13, weight: .medium)).foregroundStyle(theme.textMuted)
+                    Button("Set one up  ⇧⌘E") { model.beginEditSelected() }
                         .buttonStyle(.plain)
                         .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(theme.accent)
@@ -423,22 +397,25 @@ private struct RemotePane: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         } else if let selected = selectedTab {
-            Card(isFocused: runtime.visibleSSH.map { focus.isFocused($0.terminal) } ?? false) {
-                PaneTabStrip(side: .remote, context: context, runtime: runtime)
+            Card(isFocused: runtime.visible(side).map { focus.isFocused($0.terminal) } ?? false) {
+                PaneTabStrip(side: side, context: context, runtime: runtime)
             } content: {
+                // Every opened sub-tab stays mounted; switching only changes which is visible.
                 ZStack {
-                    ForEach(context.remoteTabs) { tab in
-                        if let session = runtime.remoteSessions[tab.id] {
+                    ForEach(pane.tabs) { tab in
+                        if let session = runtime.sessions[tab.id] {
                             let visible = isActive && tab.id == selected.id
                             TerminalSurface(view: session.terminal, isVisible: visible)
                                 .opacity(visible ? 1 : 0)
                                 .allowsHitTesting(visible)
+                                // A restarted tab gets a new session; give it a fresh host.
+                                .id(ObjectIdentifier(session))
                         }
                     }
                 }
                 .onAppear {
-                    // A saved sub-tab connects the first time it's shown (outside view updates).
-                    if runtime.remoteSessions[selected.id] == nil { _ = runtime.session(for: selected) }
+                    // A saved sub-tab starts the first time it's shown (outside view updates).
+                    if runtime.sessions[selected.id] == nil { _ = runtime.session(for: selected, side: side) }
                 }
             }
         }
@@ -456,24 +433,22 @@ private struct PaneTabStrip: View {
     @State private var newName = ""
 
     private var tabs: [PaneTab] { context.tabs(side) }
-    private var selectedID: UUID? {
-        (side == .local ? runtime.selectedLocalTab : runtime.selectedRemoteTab) ?? tabs.first?.id
-    }
+    private var pane: PaneConfig { context[side] }
+    private var selectedID: UUID? { runtime.selectedTab(side) }
 
     var body: some View {
         HStack(spacing: 6) {
-            Image(systemName: side == .local ? "laptopcomputer" : "network")
+            Image(systemName: pane.isLocal ? "laptopcomputer" : "network")
                 .font(.system(size: 10, weight: .medium))
                 .foregroundStyle(theme.textFaint)
                 .padding(.leading, 4)
-                .help(side == .local ? context.localDir : context.host + (context.remoteDir.isEmpty ? "" : ":" + context.remoteDir))
+                .help(pane.location)
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 2) {
                     ForEach(Array(tabs.enumerated()), id: \.element.id) { index, tab in
                         PaneTabButton(
                             tab: tab,
-                            ssh: side == .remote ? runtime.remoteSessions[tab.id] : nil,
-                            local: side == .local ? runtime.localSessions[tab.id] : nil,
+                            session: runtime.sessions[tab.id],
                             isSelected: tab.id == selectedID,
                             canClose: index > 0,
                             namespace: pill,
@@ -483,7 +458,7 @@ private struct PaneTabStrip: View {
                     }
                 }
             }
-            IconButton(systemName: "plus", help: side == .local ? "New local tab (⇧⌘T)" : "New SSH tab (⇧⌘T)") {
+            IconButton(systemName: "plus", help: pane.isSSH ? "New tab on \(pane.trimmedHost) (⇧⌘T)" : "New local tab (⇧⌘T)") {
                 model.addTab(side)
             }
         }
@@ -503,8 +478,7 @@ private struct PaneTabStrip: View {
 
 private struct PaneTabButton: View {
     let tab: PaneTab
-    let ssh: SSHSession?
-    let local: LocalSession?
+    let session: TerminalSession?
     let isSelected: Bool
     let canClose: Bool
     let namespace: Namespace.ID
@@ -515,11 +489,11 @@ private struct PaneTabButton: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            if let ssh { SSHStateDot(session: ssh) }
+            if let session, session.isRemote { SSHStateDot(session: session) }
             Text(tab.name)
                 .font(theme.mono(11))
                 .foregroundStyle(isSelected ? theme.text : theme.textMuted)
-            if let local { LocalRestart(session: local) }
+            if let session, !session.isRemote { LocalRestart(session: session) }
             if canClose {
                 Button(action: close) {
                     Image(systemName: "xmark").font(.system(size: 8, weight: .bold))
@@ -551,7 +525,7 @@ private struct PaneTabButton: View {
     }
 
     private struct SSHStateDot: View {
-        @ObservedObject var session: SSHSession
+        @ObservedObject var session: TerminalSession
         var body: some View {
             let c = color(for: session.state)
             Circle().fill(c).frame(width: 6, height: 6).shadow(color: c.opacity(0.7), radius: 2)
@@ -560,9 +534,9 @@ private struct PaneTabButton: View {
 
     /// Shown only when the tab's shell has exited.
     private struct LocalRestart: View {
-        @ObservedObject var session: LocalSession
+        @ObservedObject var session: TerminalSession
         var body: some View {
-            if !session.isRunning {
+            if session.state == .ended {
                 Button("restart") { session.start() }
                     .buttonStyle(.plain)
                     .font(.system(size: 10, weight: .medium))
@@ -587,8 +561,8 @@ private struct ContextHeader: View {
                 .fixedSize()
                 .padding(.trailing, 6)
             GitChip(git: runtime.git) { toggle(.git) }
-            if let ssh = runtime.primarySSH {
-                SSHChip(context: context, session: ssh)
+            ForEach(runtime.sshPrimaries, id: \.tab.id) { ssh in
+                SSHChip(pane: context[ssh.side], session: ssh)
                     .layoutPriority(-1)
             }
             if let jobs = runtime.jobs {
@@ -596,8 +570,10 @@ private struct ContextHeader: View {
             }
             Spacer(minLength: 8)
             HStack(spacing: 2) {
-                if let ssh = runtime.visibleSSH {
-                    IconButton(systemName: "arrow.clockwise", help: "Refresh SSH pane") { ssh.refresh() }
+                if context.hasHost {
+                    IconButton(systemName: "arrow.clockwise", help: "Refresh SSH panes") {
+                        context.sshSides.compactMap(runtime.visible).forEach { $0.refresh() }
+                    }
                 }
                 if context.hasHost {
                     IconButton(systemName: "folder", help: "Remote files", isActive: model.drawerTab == .files) {
@@ -726,14 +702,14 @@ private struct Chip<Content: View>: View {
 }
 
 private struct SSHChip: View {
-    let context: WorkContext
-    @ObservedObject var session: SSHSession
+    let pane: PaneConfig
+    @ObservedObject var session: TerminalSession
 
     var body: some View {
         Chip(icon: "network") {
             let c = color(for: session.state)
             Circle().fill(c).frame(width: 6, height: 6).shadow(color: c.opacity(0.7), radius: 2)
-            Text(context.host)
+            Text(pane.trimmedHost)
             switch session.state {
             case .running:
                 EmptyView()
@@ -747,7 +723,7 @@ private struct SSHChip: View {
                 ChipAction(title: "reconnect") { session.reconnectNow() }
             }
         }
-        .help(context.host + (context.remoteDir.isEmpty ? "" : ":" + context.remoteDir))
+        .help(pane.location)
     }
 }
 
@@ -923,7 +899,7 @@ private struct EmptyState: View {
                     .foregroundStyle(theme.accent)
             }
             Text("No contexts yet").font(.system(size: 17, weight: .semibold))
-            Text("A context pairs a local terminal with an SSH session.")
+            Text("A context pairs two terminals, each on this Mac or any SSH host.")
                 .font(.system(size: 12))
                 .foregroundStyle(theme.textMuted)
             Button("New context  ⌘T") { model.beginNew() }
@@ -952,19 +928,22 @@ private struct ContextEditor: View {
     @EnvironmentObject private var model: AppModel
     @State var draft: WorkContext
     let isNew: Bool
-    private let knownHosts = SSHConfig.hosts()
-    /// Conversations in the draft's folder, newest first, for the picker.
-    @State private var conversations: [ClaudeHistory.Conversation] = []
-    /// The pinned conversation when the editor opened, and the one picked now.
-    @State private var originalConversation: String?
-    @State private var conversation: String?
+    @State private var leftChoice: ConversationChoice
+    @State private var rightChoice: ConversationChoice
+    private let leftPin: String?
+    private let rightPin: String?
 
     init(draft: WorkContext, isNew: Bool) {
         _draft = State(initialValue: draft)
         self.isNew = isNew
-        let pinned = isNew ? nil : ClaudePins.shared[draft.id]
-        _originalConversation = State(initialValue: pinned)
-        _conversation = State(initialValue: pinned)
+        func choice(_ side: PaneSide) -> ConversationChoice {
+            let pinned = isNew ? nil : ClaudePins.shared[draft.id, side]
+            return ConversationChoice(original: pinned, picked: pinned)
+        }
+        leftPin = isNew ? nil : ClaudePins.shared[draft.id, .left]
+        rightPin = isNew ? nil : ClaudePins.shared[draft.id, .right]
+        _leftChoice = State(initialValue: choice(.left))
+        _rightChoice = State(initialValue: choice(.right))
     }
 
     var body: some View {
@@ -972,45 +951,15 @@ private struct ContextEditor: View {
             Text(isNew ? "New context" : "Edit context").font(.system(size: 15, weight: .semibold))
             Form {
                 TextField("Name", text: $draft.name)
-                Section("Local") {
-                    HStack {
-                        TextField("Directory", text: $draft.localDir)
-                        Button("Choose…", action: chooseDirectory)
-                    }
-                    TextField("Startup command", text: $draft.startupCommand, prompt: Text("claude"))
-                    Toggle("Resume this context's Claude conversation", isOn: $draft.resumeConversation)
-                    if draft.resumeConversation {
-                        Picker("Conversation", selection: $conversation) {
-                            if originalConversation == nil {
-                                Text("Most recent in this folder").tag(String?.none)
-                            } else if !conversations.contains(where: { $0.id == originalConversation }) {
-                                Text("Current (no messages yet)").tag(originalConversation)
-                            }
-                            ForEach(conversations) { c in
-                                Text(conversationLabel(c)).tag(Optional(c.id))
-                            }
-                            Divider()
-                            Text("New conversation").tag(Optional(Self.newConversation))
-                        }
-                    }
-                    Text(startupFootnote)
+                PaneEditor(side: .left, pane: $draft.left, choice: $leftChoice,
+                           saved: savedPane(.left), pinned: leftPin, isNew: isNew)
+                PaneEditor(side: .right, pane: $draft.right, choice: $rightChoice,
+                           saved: savedPane(.right), pinned: rightPin, isNew: isNew)
+                Section {
+                    Text(footnote)
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
-                }
-                Section("Remote") {
-                    HStack {
-                        TextField("Host", text: $draft.host, prompt: Text("alias from ~/.ssh/config, or user@host"))
-                        if !knownHosts.isEmpty {
-                            Menu("Hosts") {
-                                ForEach(knownHosts, id: \.self) { host in
-                                    Button(host) { draft.host = host }
-                                }
-                            }
-                            .fixedSize()
-                        }
-                    }
-                    TextField("Directory", text: $draft.remoteDir, prompt: Text("~/scratch/project (optional)"))
                 }
             }
             .formStyle(.grouped)
@@ -1027,31 +976,139 @@ private struct ContextEditor: View {
             }
         }
         .padding(20)
-        .frame(width: 520)
+        .frame(width: 540, height: 680)
         .background(theme.canvas)
-        .task(id: draft.localDir) { await loadConversations() }
     }
 
-    private static let newConversation = "new"
-
-    private var conversationChanged: Bool {
-        draft.resumeConversation && conversation != originalConversation
+    private func savedPane(_ side: PaneSide) -> PaneConfig? {
+        isNew ? nil : model.contexts.first(where: { $0.id == draft.id })?[side]
     }
 
-    private var startupFootnote: String {
-        if conversationChanged && !isNew {
+    private var footnote: String {
+        let restarts = PaneSide.allCases.filter { side in
+            guard let saved = savedPane(side) else { return false }
+            return saved.launchTarget != draft[side].launchTarget
+        }
+        if !restarts.isEmpty {
+            return "Saving moves the \(restarts.map { $0.label.lowercased() }.joined(separator: " and ")) pane: its tmux sessions there are ended and fresh ones start in the new place."
+        }
+        if leftChoice.changed(draft.left) || rightChoice.changed(draft.right) {
             return "Saving restarts the Claude tab in the chosen conversation."
         }
-        return "The startup command runs only when Helios creates a new local session (first open, after a reboot, or after the shell exits). Otherwise Helios reattaches to what's already running. With resume on, a plain `claude` reopens this context's conversation, which Helios follows as it changes (including /resume inside the tab)."
+        return "Each pane runs on this Mac or any SSH host. The startup command runs in the pane's first tab only when Helios creates a new session (first open, after a reboot, or after the shell exits); otherwise Helios reattaches to what's already running. With resume on, a plain `claude` reopens that pane's own conversation, which Helios follows as it changes (including /resume inside the tab), locally or on the host."
     }
 
-    private func conversationLabel(_ c: ClaudeHistory.Conversation) -> String {
+    private func save() {
+        var conversations: [PaneSide: String] = [:]
+        for (side, choice) in [(PaneSide.left, leftChoice), (.right, rightChoice)] {
+            guard choice.changed(draft[side]), let picked = choice.picked else { continue }
+            conversations[side] = picked == ConversationChoice.new ? UUID().uuidString.lowercased() : picked
+        }
+        model.commit(draft, conversations: conversations)
+    }
+}
+
+/// The Claude conversation picker's state for one pane.
+private struct ConversationChoice {
+    static let new = "new"
+    /// Conversations in the pane's folder, newest first.
+    var list: [ClaudeHistory.Conversation] = []
+    /// The pinned conversation when the editor opened, and the one picked now.
+    var original: String?
+    var picked: String?
+
+    func changed(_ pane: PaneConfig) -> Bool {
+        pane.isLocal && pane.resumeConversation && picked != original
+    }
+}
+
+/// Where one pane runs and what it starts with.
+private struct PaneEditor: View {
+    let side: PaneSide
+    @Binding var pane: PaneConfig
+    @Binding var choice: ConversationChoice
+    /// The pane as saved, to tell when its folder changed; nil for a new context.
+    let saved: PaneConfig?
+    /// The pane's pinned conversation when the editor opened.
+    let pinned: String?
+    let isNew: Bool
+    private let knownHosts = SSHConfig.hosts()
+
+    var body: some View {
+        Section("\(side.label) pane") {
+            Picker("Runs on", selection: $pane.kind) {
+                Text("This Mac").tag(PaneKind.local)
+                Text("SSH host").tag(PaneKind.ssh)
+                Text("Nothing").tag(PaneKind.none)
+            }
+            .pickerStyle(.segmented)
+            if pane.kind == .ssh {
+                HStack {
+                    TextField("Host", text: $pane.host, prompt: Text("alias from ~/.ssh/config, or user@host"))
+                    if !knownHosts.isEmpty {
+                        Menu("Hosts") {
+                            ForEach(knownHosts, id: \.self) { host in
+                                Button(host) { pane.host = host }
+                            }
+                        }
+                        .fixedSize()
+                    }
+                }
+            }
+            if pane.kind != .none {
+                HStack {
+                    TextField("Directory", text: $pane.dir,
+                              prompt: Text(pane.kind == .ssh ? "~/scratch/project (optional)" : "~"))
+                    if pane.kind == .local { Button("Choose…", action: chooseDirectory) }
+                }
+                TextField("Startup command", text: $pane.startupCommand, prompt: Text("none — e.g. claude"))
+                if isClaude {
+                    Toggle("Resume this pane's Claude conversation", isOn: $pane.resumeConversation)
+                    if pane.resumeConversation && pane.kind == .local {
+                        Picker("Conversation", selection: $choice.picked) {
+                            if choice.original == nil {
+                                Text("Most recent in this folder").tag(String?.none)
+                            } else if !choice.list.contains(where: { $0.id == choice.original }) {
+                                Text("Current (no messages yet)").tag(choice.original)
+                            }
+                            ForEach(choice.list) { c in
+                                Text(label(c)).tag(Optional(c.id))
+                            }
+                            Divider()
+                            Text("New conversation").tag(Optional(ConversationChoice.new))
+                        }
+                    }
+                }
+            }
+        }
+        .task(id: pane.launchTarget) { await loadConversations() }
+    }
+
+    private var isClaude: Bool {
+        pane.startupCommand.trimmingCharacters(in: .whitespaces).split(separator: " ").first == "claude"
+    }
+
+    private func label(_ c: ClaudeHistory.Conversation) -> String {
         let when = c.modified.formatted(.relative(presentation: .named))
         return (c.title.isEmpty ? String(c.id.prefix(8)) : c.title) + " · " + when
     }
 
     private func loadConversations() async {
-        let dir = draft.localDir
+        let target = pane.launchTarget
+        // A different place has different conversations; the pin no longer applies there.
+        if !isNew, let saved, saved.launchTarget != target {
+            choice.original = nil
+            if choice.picked != ConversationChoice.new { choice.picked = nil }
+        } else if choice.original != pinned {
+            // Back to the saved place: its pin applies again.
+            choice.original = pinned
+            choice.picked = pinned
+        }
+        guard pane.isLocal else {
+            choice.list = []
+            return
+        }
+        let dir = pane.dir
         let loaded = await Task.detached(priority: .userInitiated) {
             ClaudeHistory.conversations(in: dir).prefix(30).map { c -> ClaudeHistory.Conversation in
                 var c = c
@@ -1059,31 +1116,18 @@ private struct ContextEditor: View {
                 return c
             }
         }.value
-        guard dir == draft.localDir else { return }
-        conversations = loaded
-        // A different folder has different conversations; the pin no longer applies there.
-        if !isNew, dir != model.contexts.first(where: { $0.id == draft.id })?.localDir {
-            originalConversation = nil
-            if conversation != Self.newConversation { conversation = nil }
-        }
-    }
-
-    private func save() {
-        var choice: String?
-        if conversationChanged, let picked = conversation {
-            choice = picked == Self.newConversation ? UUID().uuidString.lowercased() : picked
-        }
-        model.commit(draft, conversation: choice)
+        guard target == pane.launchTarget else { return }
+        choice.list = loaded
     }
 
     private func chooseDirectory() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
-        panel.directoryURL = URL(fileURLWithPath: expandTilde(draft.localDir))
+        panel.directoryURL = URL(fileURLWithPath: expandTilde(pane.dir.isEmpty ? "~" : pane.dir))
         if panel.runModal() == .OK, let url = panel.url {
             let home = FileManager.default.homeDirectoryForCurrentUser.path
-            draft.localDir = url.path.hasPrefix(home) ? "~" + url.path.dropFirst(home.count) : url.path
+            pane.dir = url.path.hasPrefix(home) ? "~" + url.path.dropFirst(home.count) : url.path
         }
     }
 }

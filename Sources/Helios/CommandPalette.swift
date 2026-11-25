@@ -24,7 +24,7 @@ struct CommandPalette: View {
     private var items: [Item] {
         var items: [Item] = model.contexts.enumerated().map { index, context in
             Item(id: "ctx-\(context.id)", title: context.name,
-                 subtitle: context.hasHost ? "\(context.host) · \(context.localDir)" : context.localDir,
+                 subtitle: context.summary,
                  context: context, shortcut: index < 9 ? "⌘\(index + 1)" : "") {
                 withAnimation(.snappy(duration: 0.24)) { model.selectedID = context.id }
             }
@@ -40,26 +40,27 @@ struct CommandPalette: View {
                 if model.drawerTab != tab { model.toggleDrawer(tab) }
             })
         }
-        items += [
-            Item(id: "focus-local", title: "Focus local pane", icon: "laptopcomputer", shortcut: "⌘[", keepsFocus: true) {
-                model.focusPane(remote: false)
-            },
-            Item(id: "local-tab", title: "New local tab", icon: "plus.rectangle.on.rectangle", keepsFocus: true) {
-                model.addTab(.local)
-            },
-        ]
-        if model.selected?.hasHost == true {
-            items += [
-                Item(id: "focus-remote", title: "Focus SSH pane", icon: "network", shortcut: "⌘]", keepsFocus: true) {
-                    model.focusPane(remote: true)
-                },
-                Item(id: "ssh-tab", title: "New SSH tab", icon: "plus.rectangle.on.rectangle", keepsFocus: true) {
-                    model.addTab(.remote)
-                },
-                Item(id: "reconnect", title: "Reconnect SSH", icon: "arrow.triangle.2.circlepath") {
-                    if let selected = model.selected { model.existingRuntime(for: selected.id)?.visibleSSH?.refresh() }
-                },
-            ]
+        if let selected = model.selected {
+            for side in PaneSide.allCases where selected[side].hasTerminal {
+                let pane = selected[side]
+                let key = side == .left ? "[" : "]"
+                items += [
+                    Item(id: "focus-\(side.rawValue)", title: "Focus \(side.rawValue) pane", subtitle: pane.location,
+                         icon: pane.isSSH ? "network" : "laptopcomputer", shortcut: "⌘" + key, keepsFocus: true) {
+                        model.focusPane(side)
+                    },
+                    Item(id: "\(side.rawValue)-tab", title: "New tab in \(side.rawValue) pane", subtitle: pane.location,
+                         icon: "plus.rectangle.on.rectangle", keepsFocus: true) {
+                        model.addTab(side)
+                    },
+                ]
+            }
+            if selected.hasHost {
+                items.append(Item(id: "reconnect", title: "Reconnect SSH", icon: "arrow.triangle.2.circlepath") {
+                    guard let runtime = model.existingRuntime(for: selected.id) else { return }
+                    selected.sshSides.compactMap(runtime.visible).forEach { $0.refresh() }
+                })
+            }
         }
         items += [
             Item(id: "tab-next", title: "Next tab in focused pane", icon: "chevron.right", shortcut: "⇧⌘→", keepsFocus: true) {

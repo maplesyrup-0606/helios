@@ -48,6 +48,7 @@ final class AppModel: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 ClaudePins.shared.sync(self.store.contexts)
+                await ClaudePins.shared.syncRemote(self.store.contexts)
             }
         }
         // Observers don't fire during init; start the first context once the app is running.
@@ -101,33 +102,41 @@ final class AppModel: ObservableObject {
         editing = selected
     }
 
-    /// Saves an edited context. `conversation`, when given, is the Claude conversation the
-    /// primary local tab should be in; a change restarts that tab into it.
-    func commit(_ context: WorkContext, conversation: String? = nil) {
+    /// Saves an edited context. `conversations` holds, per pane, the Claude conversation its
+    /// primary tab should be in; a change restarts that tab into it.
+    func commit(_ context: WorkContext, conversations: [PaneSide: String] = [:]) {
         objectWillChange.send()
-        if let index = store.contexts.firstIndex(where: { $0.id == context.id }) {
-            let old = store.contexts[index]
-            store.contexts[index] = context
-            // Conversations belong to a folder, so a new folder starts without a pin.
-            if old.localDir != context.localDir { ClaudePins.shared[context.id] = nil }
-            let switchConversation = conversation.map { $0 != ClaudePins.shared[context.id] } ?? false
-            if let conversation { ClaudePins.shared[context.id] = conversation }
-            // Restart terminals only when something they were launched with changed.
-            // The startup command only applies to newly created sessions, so editing it never
-            // interrupts a running one. A new local dir needs a fresh local tmux session.
-            if old.localDir != context.localDir || old.host != context.host || old.remoteDir != context.remoteDir {
-                if old.localDir != context.localDir {
-                    runtimes[context.id]?.shutdown()
-                    LocalTmux.kill(old)
-                }
-                restart(context.id)
-            } else {
-                runtimes[context.id]?.update(context)
-                if switchConversation { restartClaude(context) }
+        guard let index = store.contexts.firstIndex(where: { $0.id == context.id }) else {
+            for (side, id) in conversations { ClaudePins.shared[context.id, side] = id }
+            store.contexts.append(context)
+            selectedID = context.id
+            editing = nil
+            return
+        }
+        let old = store.contexts[index]
+        store.contexts[index] = context
+        // Panes now pointed somewhere else (another machine or folder) need fresh tmux sessions;
+        // conversations belong to a folder, so those start without a pin.
+        let moved = PaneSide.allCases.filter { old[$0].launchTarget != context[$0].launchTarget }
+        for side in moved { ClaudePins.shared[context.id, side] = nil }
+        var switched: [PaneSide] = []
+        for (side, id) in conversations where !moved.contains(side) {
+            if id != ClaudePins.shared[context.id, side] { switched.append(side) }
+            ClaudePins.shared[context.id, side] = id
+        }
+        for (side, id) in conversations where moved.contains(side) { ClaudePins.shared[context.id, side] = id }
+        // The startup command only applies to newly created sessions, so editing it never
+        // interrupts a running one.
+        if !moved.isEmpty {
+            runtimes.removeValue(forKey: context.id)?.shutdown()
+            let id = context.id
+            Task {
+                for side in moved { await PaneTmux.kill(old, side) }
+                self.restart(id)
             }
         } else {
-            if let conversation { ClaudePins.shared[context.id] = conversation }
-            store.contexts.append(context)
+            runtimes[context.id]?.update(context)
+            for side in switched { restartClaude(context, side) }
         }
         selectedID = context.id
         editing = nil
@@ -136,8 +145,9 @@ final class AppModel: ObservableObject {
     func delete(_ id: UUID) {
         objectWillChange.send()
         runtimes.removeValue(forKey: id)?.shutdown()
-        if let context = store.contexts.first(where: { $0.id == id }) { LocalTmux.kill(context) }
-        ClaudePins.shared[id] = nil
+        // Remote tmux sessions are left running (they may hold jobs); local ones end with the context.
+        if let context = store.contexts.first(where: { $0.id == id }) { PaneTmux.killLocal(context) }
+        ClaudePins.shared.removeAll(for: id)
         clearAttention(id)
         store.contexts.removeAll { $0.id == id }
         if selectedID == id { selectedID = store.contexts.first?.id }
@@ -150,13 +160,13 @@ final class AppModel: ObservableObject {
         if id == selectedID { ensureRuntime(for: id) }
     }
 
-    /// Restarts the primary local tab so Claude opens the pinned conversation. Without a
+    /// Restarts a pane's primary tab so Claude opens the pinned conversation. Without a
     /// runtime, the leftover tmux session is killed so the next open starts fresh.
-    private func restartClaude(_ context: WorkContext) {
+    private func restartClaude(_ context: WorkContext, _ side: PaneSide) {
         if let runtime = runtimes[context.id] {
-            runtime.restartPrimaryLocal()
-        } else if let tab = context.localTabs.first {
-            LocalTmux.kill(session: context.localTmuxSession(for: tab))
+            Task { await runtime.restartPrimary(side) }
+        } else if let tab = context[side].tabs.first {
+            Task { await PaneTmux.kill(context, side, tabs: [tab]) }
         }
     }
 
@@ -200,16 +210,17 @@ final class AppModel: ObservableObject {
         NSApp.dockTile.badgeLabel = attention.isEmpty ? nil : "\(attention.count)"
     }
 
-    /// Returns keyboard focus to the selected context's local terminal.
+    /// Returns keyboard focus to the selected context's left terminal (or the right, if the
+    /// left pane has none).
     func focusSelectedTerminal() {
-        focusPane(remote: false)
+        guard let selected else { return }
+        focusPane(selected.left.hasTerminal ? .left : .right)
     }
 
-    /// Moves keyboard focus to the visible local (left) or SSH (right) terminal.
-    func focusPane(remote: Bool) {
+    /// Moves keyboard focus to the visible terminal of a pane.
+    func focusPane(_ side: PaneSide) {
         guard let selected, let runtime = runtimes[selected.id] else { return }
-        let target: NSView? = remote ? runtime.visibleSSH?.terminal : runtime.visibleLocal?.terminal
-        if let target { FocusTracker.shared.request(target) }
+        if let target = runtime.visible(side)?.terminal { FocusTracker.shared.request(target) }
     }
 
     func toggleDrawer(_ tab: DrawerTab? = nil) {
@@ -217,31 +228,26 @@ final class AppModel: ObservableObject {
         withAnimation(.snappy(duration: 0.28)) { drawerTab = drawerTab == target ? nil : target }
     }
 
-    // MARK: Sub-tabs (local and SSH)
+    // MARK: Sub-tabs
 
-    /// The pane holding keyboard focus; tab shortcuts act on it. Defaults to local.
+    /// The pane holding keyboard focus; tab shortcuts act on it. Defaults to the left.
     func focusedSide() -> PaneSide {
         guard let selected, let runtime = runtimes[selected.id],
-              let focused = FocusTracker.shared.focusedView else { return .local }
-        return runtime.side(of: focused) ?? .local
+              let focused = FocusTracker.shared.focusedView else { return .left }
+        return runtime.side(of: focused) ?? .left
     }
 
     private func selectTab(_ tab: PaneTab, side: PaneSide, in runtime: ContextRuntime) {
-        switch side {
-        case .local:
-            runtime.selectedLocalTab = tab.id
-            FocusTracker.shared.request(runtime.localSession(for: tab).terminal)
-        case .remote:
-            runtime.selectedRemoteTab = tab.id
-            if let session = runtime.session(for: tab) { FocusTracker.shared.request(session.terminal) }
-        }
+        runtime.select(tab.id, side: side)
+        if let session = runtime.session(for: tab, side: side) { FocusTracker.shared.request(session.terminal) }
     }
 
     /// ⇧⌘T: new sub-tab in the focused pane, focused and ready to type.
     func addTab(_ side: PaneSide? = nil) {
         guard let context = selected, let runtime = runtimes[context.id] else { return }
         var side = side ?? focusedSide()
-        if side == .remote && !context.hasHost { side = .local }
+        if !context[side].hasTerminal { side = side.other }
+        guard context[side].hasTerminal else { return }
         let tab = PaneTab(name: "shell \(context.tabs(side).count + 1)")
         update(context.id) { $0.setTabs(side, $0.tabs(side) + [tab]) }
         selectTab(tab, side: side, in: runtime)
@@ -252,8 +258,7 @@ final class AppModel: ObservableObject {
         guard let context = selected, let runtime = runtimes[context.id] else { return }
         let side = side ?? focusedSide()
         let tabs = context.tabs(side)
-        let currentID = side == .local ? runtime.selectedLocalTab : runtime.selectedRemoteTab
-        let current = tabs.firstIndex { $0.id == currentID } ?? 0
+        let current = tabs.firstIndex { $0.id == runtime.selectedTab(side) } ?? 0
         guard !tabs.isEmpty else { return }
         selectTab(tabs[(current + offset + tabs.count) % tabs.count], side: side, in: runtime)
     }
@@ -273,8 +278,7 @@ final class AppModel: ObservableObject {
     func requestCloseCurrentTab() {
         guard let context = selected, let runtime = runtimes[context.id] else { return }
         let side = focusedSide()
-        let id = side == .local ? runtime.selectedLocalTab : runtime.selectedRemoteTab
-        guard let tab = context.tabs(side).first(where: { $0.id == id }) else { return }
+        guard let tab = context.tabs(side).first(where: { $0.id == runtime.selectedTab(side) }) else { return }
         requestCloseTab(tab, side: side)
     }
 
@@ -282,18 +286,9 @@ final class AppModel: ObservableObject {
     func closeTab(_ tab: PaneTab, side: PaneSide) {
         closingTab = nil
         guard let context = selected, tab.id != context.tabs(side).first?.id else { return }
-        switch side {
-        case .local:
-            let session = context.localTmuxSession(for: tab)
-            update(context.id) { $0.localTabs.removeAll { $0.id == tab.id } }
-            LocalTmux.kill(session: session)
-        case .remote:
-            let session = context.tmuxSession(for: tab)
-            let host = context.host
-            update(context.id) { $0.remoteTabs.removeAll { $0.id == tab.id } }
-            Task.detached { _ = await Shell.remote(host, "tmux kill-session -t \(session) 2>/dev/null", timeout: 15) }
-        }
-        focusPane(remote: side == .remote)
+        update(context.id) { $0.setTabs(side, $0.tabs(side).filter { $0.id != tab.id }) }
+        Task { await PaneTmux.kill(context, side, tabs: [tab]) }
+        focusPane(side)
     }
 
     func renameTab(_ tab: PaneTab, side: PaneSide, to name: String) {
@@ -381,7 +376,7 @@ struct HeliosApp: App {
                 Button("Restart Context Terminals") { model.restartSelected() }
                     .keyboardShortcut("r", modifiers: [.command, .shift])
                 Divider()
-                // Tab shortcuts act on whichever pane (local or SSH) has keyboard focus.
+                // Tab shortcuts act on whichever pane has keyboard focus.
                 Button("New Tab in Pane") { model.addTab() }
                     .keyboardShortcut("t", modifiers: [.command, .shift])
                 Button("Next Tab in Pane") { model.selectAdjacentTab(1) }
@@ -393,9 +388,9 @@ struct HeliosApp: App {
                 Button("Command Palette…") { model.isPaletteOpen.toggle() }
                     .keyboardShortcut("k", modifiers: .command)
                 Divider()
-                Button("Focus Local Pane") { model.focusPane(remote: false) }
+                Button("Focus Left Pane") { model.focusPane(.left) }
                     .keyboardShortcut("[", modifiers: .command)
-                Button("Focus SSH Pane") { model.focusPane(remote: true) }
+                Button("Focus Right Pane") { model.focusPane(.right) }
                     .keyboardShortcut("]", modifiers: .command)
             }
             CommandMenu("Panels") {

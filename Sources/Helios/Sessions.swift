@@ -127,7 +127,7 @@ func remoteShellPath(_ path: String) -> String {
 /// and mouse mode makes the wheel scroll tmux history. Clicks and drags stay native (see HeliosTerminalView).
 let tmuxSessionOptions = [("status", "off"), ("mouse", "on")]
 
-/// Local tmux, used so the left pane (e.g. a running `claude`) survives app restarts.
+/// Local tmux, used so local panes (e.g. a running `claude`) survive app restarts.
 enum LocalTmux {
     static let path: String? = ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"]
         .first { FileManager.default.isExecutableFile(atPath: $0) }
@@ -156,49 +156,102 @@ enum LocalTmux {
         return process.terminationStatus
     }
 
-    /// Kills every local tmux session belonging to a context (all its local sub-tabs).
-    static func kill(_ context: WorkContext) {
-        context.localTabs.forEach { kill(session: context.localTmuxSession(for: $0)) }
-    }
-
     static func kill(session name: String) {
         run(["kill-session", "-t", "=" + name])
     }
 }
 
-/// A local sub-tab: a login shell in the context's directory. The primary tab also runs the
-/// startup command (Claude). Lives in a local tmux session when tmux is installed, so it
-/// outlives the app.
-@MainActor
-final class LocalSession: NSObject, ObservableObject, @preconcurrency LocalProcessTerminalViewDelegate {
-    let terminal = makeTerminalView()
-    @Published private(set) var isRunning = false
-    private let context: WorkContext
-    let tab: PaneTab
+/// Ends tmux sessions wherever a pane runs them.
+enum PaneTmux {
+    /// Kills the given sub-tabs' sessions (all of the pane's by default). Remote kills only use
+    /// an existing shared connection, so they never prompt for 2FA.
+    static func kill(_ context: WorkContext, _ side: PaneSide, tabs: [PaneTab]? = nil) async {
+        let pane = context[side]
+        let names = (tabs ?? pane.tabs).map { context.tmuxSession(side, for: $0) }
+        if pane.isLocal {
+            names.forEach(LocalTmux.kill(session:))
+        } else if pane.isSSH, !names.isEmpty {
+            let command = names.map { "tmux kill-session -t \(shellQuote("=" + $0)) 2>/dev/null" }.joined(separator: "; ")
+            _ = await Shell.remote(pane.trimmedHost, command + "; true", timeout: 15)
+        }
+    }
 
-    init(context: WorkContext, tab: PaneTab) {
+    /// Kills only the local panes' sessions, synchronously.
+    static func killLocal(_ context: WorkContext) {
+        for side in PaneSide.allCases where context[side].isLocal {
+            context[side].tabs.forEach { LocalTmux.kill(session: context.tmuxSession(side, for: $0)) }
+        }
+    }
+}
+
+/// One sub-tab's terminal: a login shell in the pane's directory, on this Mac or over ssh,
+/// inside a tmux session so it outlives the app. The pane's primary tab also runs the startup
+/// command (e.g. Claude) when its session is first created. Over ssh it reconnects
+/// automatically when the connection drops.
+@MainActor
+final class TerminalSession: NSObject, ObservableObject, @preconcurrency LocalProcessTerminalViewDelegate {
+    enum State: Equatable {
+        /// The process is running (for ssh: authenticating or attached).
+        case running
+        /// Connection lost; next attempt scheduled at the given date.
+        case waiting(attempt: Int, retryAt: Date)
+        /// The shell (or remote tmux) ended normally; no auto-reconnect.
+        case ended
+        /// Gave up after too many consecutive failures.
+        case failed
+    }
+
+    let terminal = makeTerminalView()
+    @Published private(set) var state: State = .running
+    private let context: WorkContext
+    let side: PaneSide
+    let tab: PaneTab
+    private var attempt = 0
+    private var startedAt = Date()
+    private var retryTask: Task<Void, Never>?
+    private var isStopping = false
+
+    /// ssh exits with 255 on connection/auth errors; anything else came from the remote command.
+    private static let sshErrorExit: Int32 = 255
+    private static let maxAttempts = 8
+    /// A session that stayed up this long counts as healthy and resets the backoff.
+    private static let healthyDuration: TimeInterval = 30
+
+    init(context: WorkContext, side: PaneSide, tab: PaneTab) {
         self.context = context
+        self.side = side
         self.tab = tab
         super.init()
         terminal.processDelegate = self
         start()
     }
 
-    private var isPrimary: Bool { tab.id == context.localTabs.first?.id }
+    private var pane: PaneConfig { context[side] }
+    var isRemote: Bool { pane.isSSH }
+    var host: String { pane.trimmedHost }
+    private var isPrimary: Bool { tab.id == pane.tabs.first?.id }
+    private var tmuxName: String { context.tmuxSession(side, for: tab) }
 
+    /// Starts (or, after it ended, restarts) the terminal.
     func start() {
-        let dir = expandTilde(context.localDir.isEmpty ? "~" : context.localDir)
-        isRunning = true
+        retryTask?.cancel()
+        retryTask = nil
+        isStopping = false
+        state = .running
+        startedAt = Date()
+        if isRemote { startSSH() } else { startLocal() }
+    }
 
+    private func startLocal() {
+        let dir = expandTilde(pane.trimmedDir.isEmpty ? "~" : pane.trimmedDir)
         if let tmux = LocalTmux.path {
-            let name = context.localTmuxSession(for: tab)
             // Only a new session runs the startup command; an existing one (from before an
             // app restart) is just reattached. The command is run by an interactive login shell
             // rather than typed in, since zsh startup can discard early keystrokes. When it
             // exits, the pane falls back to a normal shell.
-            if LocalTmux.run(["has-session", "-t", "=" + name]) != 0 {
+            if LocalTmux.run(["has-session", "-t", "=" + tmuxName]) != 0 {
                 let cmd = startupCommand()
-                var args = ["new-session", "-d", "-s", name, "-c", dir]
+                var args = ["new-session", "-d", "-s", tmuxName, "-c", dir]
                 if !cmd.isEmpty {
                     let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
                     args.append("exec \(shell) -lic \(shellQuote(cmd + "; exec " + shell + " -l"))")
@@ -207,9 +260,9 @@ final class LocalSession: NSObject, ObservableObject, @preconcurrency LocalProce
             }
             for (option, value) in tmuxSessionOptions {
                 // set-option takes a pane target, so an exact session match needs the trailing colon.
-                LocalTmux.run(["set-option", "-t", "=" + name + ":", option, value])
+                LocalTmux.run(["set-option", "-t", "=" + tmuxName + ":", option, value])
             }
-            terminal.startProcess(executable: tmux, args: ["attach-session", "-t", "=" + name],
+            terminal.startProcess(executable: tmux, args: ["attach-session", "-t", "=" + tmuxName],
                                   environment: terminalEnvironment(), currentDirectory: dir)
             return
         }
@@ -223,69 +276,17 @@ final class LocalSession: NSObject, ObservableObject, @preconcurrency LocalProce
         }
     }
 
-    /// The primary tab's startup command, pointed at the context's Claude conversation.
-    /// Records which conversation that is, so the next fresh start returns to it.
-    private func startupCommand() -> String {
-        guard isPrimary else { return "" }
-        let launch = ClaudeHistory.launch(for: context, pinned: ClaudePins.shared[context.id])
-        if let id = launch.sessionID { ClaudePins.shared[context.id] = id }
-        return launch.command
-    }
-
-    func stop() { if isRunning { terminal.terminate() } }
-
-    func processTerminated(source: TerminalView, exitCode: Int32?) {
-        isRunning = false
-        terminal.feed(text: "\r\n\u{1b}[2m[helios] shell exited — press Restart to start a new one\u{1b}[0m\r\n")
-    }
-
-    func sizeChanged(source: LocalProcessTerminalView, newCols: Int, newRows: Int) {}
-    func setTerminalTitle(source: LocalProcessTerminalView, title: String) {}
-    func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
-}
-
-/// The right panel: ssh into the host and attach a per-context tmux session,
-/// reconnecting automatically when the connection drops.
-@MainActor
-final class SSHSession: NSObject, ObservableObject, @preconcurrency LocalProcessTerminalViewDelegate {
-    enum State: Equatable {
-        /// ssh is running (authenticating or attached).
-        case running
-        /// Connection lost; next attempt scheduled at the given date.
-        case waiting(attempt: Int, retryAt: Date)
-        /// Remote side ended normally (tmux exited or detached); no auto-reconnect.
-        case ended
-        /// Gave up after too many consecutive failures.
-        case failed
-    }
-
-    let terminal = makeTerminalView()
-    @Published private(set) var state: State = .running
-    private let context: WorkContext
-    let tab: PaneTab
-    private var attempt = 0
-    private var startedAt = Date()
-    private var retryTask: Task<Void, Never>?
-    private var isStopping = false
-
-    /// ssh exits with 255 on connection/auth errors; anything else came from the remote command.
-    private static let sshErrorExit: Int32 = 255
-    private static let maxAttempts = 8
-    /// A session that stayed up this long counts as healthy and resets the backoff.
-    private static let healthyDuration: TimeInterval = 30
-
-    init(context: WorkContext, tab: PaneTab) {
-        self.context = context
-        self.tab = tab
-        super.init()
-        terminal.processDelegate = self
-        connect()
-    }
-
+    /// ssh into the host and attach (or create) the tab's tmux session. A newly created
+    /// session runs the startup command through a login shell, like a local one.
     private var sshArguments: [String] {
-        var tmux = "tmux new-session -A -s \(context.tmuxSession(for: tab))"
-        let dir = context.remoteDir.trimmingCharacters(in: .whitespaces)
+        var tmux = "tmux new-session -A -s \(shellQuote(tmuxName))"
+        let dir = pane.trimmedDir
         if !dir.isEmpty { tmux += " -c \(remoteShellPath(dir))" }
+        let cmd = startupCommand()
+        if !cmd.isEmpty {
+            // tmux only uses this when it creates the session; -A reattaches an existing one.
+            tmux += " " + shellQuote(#"exec "$SHELL" -lic "# + shellQuote(cmd + #"; exec "$SHELL" -l"#))
+        }
         for (option, value) in tmuxSessionOptions { tmux += " \\; set-option \(option) \(value)" }
         // Fall back to a plain login shell if tmux is missing on this host.
         let remote = "command -v tmux >/dev/null 2>&1 && exec \(tmux) || exec $SHELL -l"
@@ -293,31 +294,37 @@ final class SSHSession: NSObject, ObservableObject, @preconcurrency LocalProcess
             "-t",
             "-o", "ServerAliveInterval=15",
             "-o", "ServerAliveCountMax=3",
-        ] + SSHOptions.connectionSharing + [context.host, remote]
+        ] + SSHOptions.connectionSharing + [host, remote]
     }
 
-    func connect() {
-        retryTask?.cancel()
-        retryTask = nil
-        isStopping = false
-        state = .running
-        startedAt = Date()
+    private func startSSH() {
         terminal.startProcess(executable: "/usr/bin/ssh", args: sshArguments, environment: terminalEnvironment())
+    }
+
+    /// The primary tab's startup command, pointed at the pane's Claude conversation.
+    /// Records which conversation that is, so the next fresh start returns to it.
+    private func startupCommand() -> String {
+        guard isPrimary else { return "" }
+        let pinned = ClaudePins.shared[context.id, side]
+        let launch = isRemote ? ClaudeHistory.remoteLaunch(for: pane, pinned: pinned)
+                              : ClaudeHistory.launch(for: pane, pinned: pinned)
+        if let id = launch.sessionID { ClaudePins.shared[context.id, side] = id }
+        return launch.command
     }
 
     /// Manual reconnect: resets the backoff and skips any pending wait.
     func reconnectNow() {
         attempt = 0
         if state == .running { return }
-        connect()
+        start()
     }
 
-    /// Kills ssh even while it looks connected (e.g. a frozen pane) and reattaches tmux.
-    /// `terminate()` doesn't call `processTerminated`, so no auto-retry races this connect.
+    /// Kills the client even while it looks connected (e.g. a frozen pane) and reattaches tmux.
+    /// `terminate()` doesn't call `processTerminated`, so no auto-retry races this start.
     func refresh() {
         attempt = 0
         if state == .running { terminal.terminate() }
-        connect()
+        start()
     }
 
     func stop() {
@@ -328,6 +335,11 @@ final class SSHSession: NSObject, ObservableObject, @preconcurrency LocalProcess
 
     func processTerminated(source: TerminalView, exitCode: Int32?) {
         guard !isStopping else { return }
+        guard isRemote else {
+            state = .ended
+            terminal.feed(text: "\r\n\u{1b}[2m[helios] shell exited — press Restart to start a new one\u{1b}[0m\r\n")
+            return
+        }
         if Date().timeIntervalSince(startedAt) > Self.healthyDuration { attempt = 0 }
 
         // nil means killed by a signal (e.g. network teardown); treat like a connection error.
@@ -350,7 +362,7 @@ final class SSHSession: NSObject, ObservableObject, @preconcurrency LocalProcess
         retryTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(delay))
             guard !Task.isCancelled else { return }
-            self?.connect()
+            self?.start()
         }
     }
 
@@ -366,17 +378,16 @@ final class SSHSession: NSObject, ObservableObject, @preconcurrency LocalProcess
 /// Live terminals and monitors for one context. Kept alive across tab switches so sessions keep running.
 @MainActor
 final class ContextRuntime: ObservableObject {
-    @Published private(set) var localSessions: [UUID: LocalSession] = [:]
-    @Published var selectedLocalTab: UUID?
-    @Published private(set) var remoteSessions: [UUID: SSHSession] = [:]
-    @Published var selectedRemoteTab: UUID?
+    /// Started sub-tabs of both panes, by tab id (ids are unique across panes).
+    @Published private(set) var sessions: [UUID: TerminalSession] = [:]
+    @Published private var selected: [PaneSide: UUID] = [:]
     let git: GitMonitor
     let jobs: JobsMonitor?
     let files: FileBrowser?
     private var context: WorkContext
 
     enum Attention: Int, Comparable {
-        /// Local output burst ended (e.g. Claude finished or is waiting for input).
+        /// A primary tab's output burst ended (e.g. Claude finished or is waiting for input).
         case done = 1
         /// A terminal rang the bell.
         case bell = 2
@@ -385,135 +396,125 @@ final class ContextRuntime: ObservableObject {
 
     /// Called when something in this context wants the user's attention.
     var onAttention: ((Attention) -> Void)?
-    private var burstStart: Date?
-    private var lastOutput = Date.distantPast
-    private var quietWatch: Task<Void, Never>?
+    private var bursts: [PaneSide: Burst] = [:]
     /// Output must run at least this long, then stop for `quietPeriod`, to count as "done".
     /// Claude's spinner redraws continuously while working, so it going quiet is the signal.
     private static let minBurst: TimeInterval = 3
     private static let quietPeriod: TimeInterval = 4
 
+    private struct Burst {
+        var start: Date?
+        var lastOutput = Date.distantPast
+        var watch: Task<Void, Never>?
+    }
+
     init(context: WorkContext) {
         self.context = context
         git = GitMonitor(directory: context.localDir, host: context.hasHost ? context.host : nil, remoteDir: context.remoteDir)
         jobs = context.hasHost ? JobsMonitor(host: context.host) : nil
-        files = context.hasHost ? FileBrowser(host: context.host, startDir: context.remoteDir, localDir: context.localDir) : nil
-        selectedRemoteTab = context.remoteTabs.first?.id
-        if context.hasHost, let first = context.remoteTabs.first {
-            remoteSessions[first.id] = makeSSHSession(first)
-        }
-        selectedLocalTab = context.localTabs.first?.id
-        if let first = context.localTabs.first {
-            localSessions[first.id] = makeLocalSession(first)
+        files = context.hasHost
+            ? FileBrowser(host: context.host, startDir: context.remoteDir, localDir: context.localDir ?? "~/Downloads")
+            : nil
+        for side in PaneSide.allCases {
+            selected[side] = context[side].tabs.first?.id
+            if context[side].hasTerminal, let first = context[side].tabs.first {
+                sessions[first.id] = makeSession(side, first)
+            }
         }
     }
 
-    private func makeLocalSession(_ tab: PaneTab) -> LocalSession {
-        let session = LocalSession(context: context, tab: tab)
+    private func makeSession(_ side: PaneSide, _ tab: PaneTab) -> TerminalSession {
+        let session = TerminalSession(context: context, side: side, tab: tab)
         session.terminal.onBell = { [weak self] in self?.onAttention?(.bell) }
-        // "Went quiet" is only meaningful for the primary tab, where Claude runs.
-        if tab.id == context.localTabs.first?.id {
-            session.terminal.onOutput = { [weak self] in self?.noteLocalOutput() }
+        // "Went quiet" is only meaningful for a primary tab running a startup command (Claude).
+        if tab.id == context[side].tabs.first?.id, !context[side].startupCommand.isEmpty {
+            session.terminal.onOutput = { [weak self] in self?.noteOutput(side) }
         }
         return session
     }
 
-    /// The primary local session (Claude).
-    var primaryLocal: LocalSession? {
-        context.localTabs.first.flatMap { localSessions[$0.id] }
+    func selectedTab(_ side: PaneSide) -> UUID? { selected[side] ?? context[side].tabs.first?.id }
+
+    func select(_ tab: UUID, side: PaneSide) { selected[side] = tab }
+
+    /// A pane's primary session (the first tab).
+    func primary(_ side: PaneSide) -> TerminalSession? {
+        context[side].tabs.first.flatMap { sessions[$0.id] }
     }
 
-    /// The local sub-tab currently shown.
-    var visibleLocal: LocalSession? {
-        (selectedLocalTab ?? context.localTabs.first?.id).flatMap { localSessions[$0] }
+    /// The sub-tab currently shown in a pane.
+    func visible(_ side: PaneSide) -> TerminalSession? {
+        selectedTab(side).flatMap { sessions[$0] }
     }
 
-    /// The SSH sub-tab currently shown.
-    var visibleSSH: SSHSession? {
-        (selectedRemoteTab ?? context.remoteTabs.first?.id).flatMap { remoteSessions[$0] }
+    /// The primary session of the pane that jobs/files/remote git follow (sidebar status dot).
+    var primarySSH: TerminalSession? { context.primarySSHSide.flatMap(primary) }
+
+    /// Primary sessions of every ssh pane, one per host.
+    var sshPrimaries: [TerminalSession] {
+        var seen = Set<String>()
+        return context.sshSides.compactMap(primary).filter { seen.insert($0.host).inserted }
     }
 
-    /// Local session for a sub-tab, starting it the first time it is shown.
-    func localSession(for tab: PaneTab) -> LocalSession {
-        if let existing = localSessions[tab.id] { return existing }
-        let session = makeLocalSession(tab)
-        localSessions[tab.id] = session
+    /// Session for a sub-tab, starting it the first time it is shown; nil when the pane has
+    /// no terminal.
+    func session(for tab: PaneTab, side: PaneSide) -> TerminalSession? {
+        guard context[side].hasTerminal else { return nil }
+        if let existing = sessions[tab.id] { return existing }
+        let session = makeSession(side, tab)
+        sessions[tab.id] = session
         return session
     }
 
-    /// Replaces the primary local tab with a fresh session (killing its tmux session), so the
+    /// Replaces a pane's primary tab with a fresh session (killing its tmux session), so the
     /// startup command runs again, e.g. to open a different Claude conversation.
-    func restartPrimaryLocal() {
-        guard let tab = context.localTabs.first else { return }
-        localSessions[tab.id]?.stop()
-        LocalTmux.kill(session: context.localTmuxSession(for: tab))
-        localSessions[tab.id] = makeLocalSession(tab)
+    func restartPrimary(_ side: PaneSide) async {
+        guard let tab = context[side].tabs.first else { return }
+        sessions[tab.id]?.stop()
+        sessions[tab.id] = nil
+        await PaneTmux.kill(context, side, tabs: [tab])
+        guard context[side].hasTerminal else { return }
+        sessions[tab.id] = makeSession(side, tab)
     }
 
     /// Which pane a terminal view belongs to, if any.
     func side(of view: NSView) -> PaneSide? {
-        if localSessions.values.contains(where: { $0.terminal === view }) { return .local }
-        if remoteSessions.values.contains(where: { $0.terminal === view }) { return .remote }
-        return nil
+        sessions.values.first { $0.terminal === view }?.side
     }
 
-    private func makeSSHSession(_ tab: PaneTab) -> SSHSession {
-        let session = SSHSession(context: context, tab: tab)
-        session.terminal.onBell = { [weak self] in self?.onAttention?(.bell) }
-        return session
-    }
-
-    private func noteLocalOutput() {
+    private func noteOutput(_ side: PaneSide) {
         let now = Date()
-        if burstStart == nil { burstStart = now }
-        lastOutput = now
-        guard quietWatch == nil else { return }
-        quietWatch = Task { [weak self] in
+        var burst = bursts[side] ?? Burst()
+        if burst.start == nil { burst.start = now }
+        burst.lastOutput = now
+        defer { bursts[side] = burst }
+        guard burst.watch == nil else { return }
+        burst.watch = Task { [weak self] in
             while let self, !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
-                guard Date().timeIntervalSince(self.lastOutput) >= Self.quietPeriod else { continue }
-                if let start = self.burstStart, self.lastOutput.timeIntervalSince(start) >= Self.minBurst {
+                guard let current = self.bursts[side],
+                      Date().timeIntervalSince(current.lastOutput) >= Self.quietPeriod else { continue }
+                if let start = current.start, current.lastOutput.timeIntervalSince(start) >= Self.minBurst {
                     self.onAttention?(.done)
                 }
-                self.burstStart = nil
-                self.quietWatch = nil
+                self.bursts[side] = Burst()
                 return
             }
         }
     }
 
-    /// The primary SSH session, used for the sidebar status dot.
-    var primarySSH: SSHSession? {
-        context.remoteTabs.first.flatMap { remoteSessions[$0.id] }
-    }
-
-    /// Session for a sub-tab, connecting lazily the first time it is shown.
-    func session(for tab: PaneTab) -> SSHSession? {
-        guard context.hasHost else { return nil }
-        if let existing = remoteSessions[tab.id] { return existing }
-        let session = makeSSHSession(tab)
-        remoteSessions[tab.id] = session
-        return session
-    }
-
     /// Picks up edits that don't require restarting terminals (names, notes, sub-tabs).
     func update(_ context: WorkContext) {
         self.context = context
-        let live = Set(context.remoteTabs.map(\.id))
-        for (id, session) in remoteSessions where !live.contains(id) {
+        let live = Set(PaneSide.allCases.flatMap { context[$0].tabs.map(\.id) })
+        for (id, session) in sessions where !live.contains(id) {
             session.stop()
-            remoteSessions[id] = nil
+            sessions[id] = nil
         }
-        if let selected = selectedRemoteTab, !live.contains(selected) {
-            selectedRemoteTab = context.remoteTabs.first?.id
-        }
-        let liveLocal = Set(context.localTabs.map(\.id))
-        for (id, session) in localSessions where !liveLocal.contains(id) {
-            session.stop()
-            localSessions[id] = nil
-        }
-        if let selected = selectedLocalTab, !liveLocal.contains(selected) {
-            selectedLocalTab = context.localTabs.first?.id
+        for side in PaneSide.allCases {
+            if let current = selected[side], !context[side].tabs.contains(where: { $0.id == current }) {
+                selected[side] = context[side].tabs.first?.id
+            }
         }
     }
 
@@ -525,8 +526,7 @@ final class ContextRuntime: ObservableObject {
 
     func shutdown() {
         setActive(false)
-        quietWatch?.cancel()
-        localSessions.values.forEach { $0.stop() }
-        remoteSessions.values.forEach { $0.stop() }
+        bursts.values.forEach { $0.watch?.cancel() }
+        sessions.values.forEach { $0.stop() }
     }
 }

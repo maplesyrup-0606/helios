@@ -74,13 +74,31 @@ enum ClaudeHistory {
     /// Claude Code's internal state, so a missing or changed format just yields nil.
     static func liveSessionID(tmuxSession: String, registryDir: String = defaultRegistryDir) -> String? {
         let files = (try? FileManager.default.contentsOfDirectory(atPath: registryDir)) ?? []
-        var best: (id: String, updated: Double)?
-        for name in files where name.hasSuffix(".json") {
+        let entries = files.filter { $0.hasSuffix(".json") }.compactMap { name -> [String: Any]? in
             guard let data = FileManager.default.contents(atPath: (registryDir as NSString).appendingPathComponent(name)),
                   let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-                  let id = obj["sessionId"] as? String, isUUID(id),
-                  let tmux = obj["tmux"] as? String, tmux.split(separator: ":").first.map(String.init) == tmuxSession,
-                  let pid = (obj["pid"] as? NSNumber)?.int32Value, isAlive(pid)
+                  let pid = (obj["pid"] as? NSNumber)?.int32Value, isAlive(pid) else { return nil }
+            return obj
+        }
+        return liveSessionID(tmuxSession: tmuxSession, entries: entries)
+    }
+
+    /// Prints the registry entries of live Claude processes on a remote host, one JSON object
+    /// per line. Registry files are named by pid, so liveness is checked there.
+    static let remoteRegistryScript = #"for f in "$HOME"/.claude/sessions/*.json; do [ -f "$f" ] || continue; p=$(basename "$f" .json); kill -0 "$p" 2>/dev/null || continue; tr -d '\n' < "$f"; echo; done"#
+
+    /// Parses `remoteRegistryScript` output.
+    static func registryEntries(fromLines output: String) -> [[String: Any]] {
+        output.split(separator: "\n").compactMap { json($0) }
+    }
+
+    /// The newest live registry entry attached to the given tmux session (entries must already be
+    /// filtered to live processes).
+    static func liveSessionID(tmuxSession: String, entries: [[String: Any]]) -> String? {
+        var best: (id: String, updated: Double)?
+        for obj in entries {
+            guard let id = obj["sessionId"] as? String, isUUID(id),
+                  let tmux = obj["tmux"] as? String, tmux.split(separator: ":").first.map(String.init) == tmuxSession
             else { continue }
             let updated = (obj["updatedAt"] as? NSNumber)?.doubleValue ?? 0
             if best == nil || updated > best!.updated { best = (id, updated) }
@@ -88,20 +106,27 @@ enum ClaudeHistory {
         return best?.id
     }
 
-    /// What to launch for the primary local tab, and the conversation it will be in.
-    /// A plain `claude` with resume on is pointed at the context's pinned conversation:
+    /// The startup command when it is a plain `claude` Helios should point at a conversation;
+    /// nil when resume is off or the command makes its own resume choice.
+    private static func managedClaude(_ pane: PaneConfig) -> String? {
+        let cmd = pane.startupCommand.trimmingCharacters(in: .whitespaces)
+        let words = cmd.split(separator: " ").map(String.init)
+        let resumeFlags = ["--continue", "-c", "--resume", "-r", "--session-id", "--from-pr", "--teleport"]
+        guard pane.resumeConversation, words.first == "claude",
+              !words.contains(where: { word in resumeFlags.contains { word == $0 || word.hasPrefix($0 + "=") } })
+        else { return nil }
+        return cmd
+    }
+
+    /// What to launch for a local pane's primary tab, and the conversation it will be in.
+    /// A plain `claude` with resume on is pointed at the pane's pinned conversation:
     /// `--resume` when its transcript exists, else `--session-id` so a new conversation gets
     /// that id. With no pin yet, the project's newest conversation is adopted (or a fresh id
     /// when there is none). Anything else is left as typed.
-    static func launch(for context: WorkContext, pinned: String?,
+    static func launch(for pane: PaneConfig, pinned: String?,
                        root: String = defaultProjectsRoot) -> (command: String, sessionID: String?) {
-        let cmd = context.startupCommand.trimmingCharacters(in: .whitespaces)
-        let words = cmd.split(separator: " ").map(String.init)
-        let resumeFlags = ["--continue", "-c", "--resume", "-r", "--session-id", "--from-pr", "--teleport"]
-        guard context.resumeConversation, words.first == "claude",
-              !words.contains(where: { word in resumeFlags.contains { word == $0 || word.hasPrefix($0 + "=") } })
-        else { return (cmd, nil) }
-        let dir = context.localDir
+        guard let cmd = managedClaude(pane) else { return (pane.startupCommand.trimmingCharacters(in: .whitespaces), nil) }
+        let dir = pane.dir
         if let id = pinned, isUUID(id) {
             return hasTranscript(id, in: dir, root: root) ? (cmd + " --resume " + id, id) : (cmd + " --session-id " + id, id)
         }
@@ -110,6 +135,20 @@ enum ClaudeHistory {
         }
         let fresh = UUID().uuidString.lowercased()
         return (cmd + " --session-id " + fresh, fresh)
+    }
+
+    /// Same as `launch`, for an ssh pane: the transcripts live on the host, so the choice is
+    /// made there by a small shell script run in the pane's directory. With no pin, the
+    /// conversation isn't known here until the registry sync sees Claude running.
+    static func remoteLaunch(for pane: PaneConfig, pinned: String?) -> (command: String, sessionID: String?) {
+        guard let cmd = managedClaude(pane) else { return (pane.startupCommand.trimmingCharacters(in: .whitespaces), nil) }
+        let folder = #"d="$HOME/.claude/projects/$(pwd -P | sed 's/[^A-Za-z0-9]/-/g')"; "#
+        if let id = pinned, isUUID(id) {
+            return (folder + #"if [ -f "$d/\#(id).jsonl" ]; then \#(cmd) --resume \#(id); else \#(cmd) --session-id \#(id); fi"#, id)
+        }
+        let fresh = UUID().uuidString.lowercased()
+        let newest = #"n=$(ls -t "$d" 2>/dev/null | grep -E '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$' | head -n 1); "#
+        return (folder + newest + #"if [ -n "$n" ]; then \#(cmd) --resume "${n%.jsonl}"; else \#(cmd) --session-id \#(fresh); fi"#, nil)
     }
 
     static func isUUID(_ s: String) -> Bool { UUID(uuidString: s) != nil }
@@ -127,8 +166,8 @@ enum ClaudeHistory {
     }
 }
 
-/// Which Claude conversation each context's primary local tab is in, so a fresh start (e.g.
-/// after a reboot) resumes that conversation instead of whatever is newest in the folder.
+/// Which Claude conversation each pane's primary tab is in, so a fresh start (e.g. after a
+/// reboot) resumes that conversation instead of whatever is newest in the folder.
 /// Kept apart from contexts.json because it changes on its own while Claude runs.
 @MainActor
 final class ClaudePins {
@@ -149,23 +188,57 @@ final class ClaudePins {
             .appendingPathComponent("claude-sessions.json")
     }
 
-    subscript(context: UUID) -> String? {
-        get { pins[context.uuidString] }
+    /// The left pane keeps the bare context id, as pins were stored before panes were configurable.
+    private static func key(_ context: UUID, _ side: PaneSide) -> String {
+        side == .left ? context.uuidString : context.uuidString + ":right"
+    }
+
+    subscript(context: UUID, side: PaneSide) -> String? {
+        get { pins[Self.key(context, side)] }
         set {
-            guard pins[context.uuidString] != newValue else { return }
-            pins[context.uuidString] = newValue
+            let key = Self.key(context, side)
+            guard pins[key] != newValue else { return }
+            pins[key] = newValue
             save()
         }
     }
 
-    /// Follows the conversation each running Claude is actually in (it changes with /resume
-    /// or /clear inside the tab).
+    func removeAll(for context: UUID) {
+        PaneSide.allCases.forEach { self[context, $0] = nil }
+    }
+
+    /// Follows the conversation each running local Claude is actually in (it changes with
+    /// /resume or /clear inside the tab).
     func sync(_ contexts: [WorkContext]) {
         for context in contexts {
-            guard let tab = context.localTabs.first,
-                  let live = ClaudeHistory.liveSessionID(tmuxSession: context.localTmuxSession(for: tab))
-            else { continue }
-            self[context.id] = live
+            for side in PaneSide.allCases where context[side].isLocal {
+                guard let tab = context[side].tabs.first,
+                      let live = ClaudeHistory.liveSessionID(tmuxSession: context.tmuxSession(side, for: tab))
+                else { continue }
+                self[context.id, side] = live
+            }
+        }
+    }
+
+    /// The same for Claude running in ssh panes: one registry read per host, only over an
+    /// existing shared connection (never a new login).
+    func syncRemote(_ contexts: [WorkContext]) async {
+        var panes: [String: [(UUID, PaneSide, String)]] = [:]
+        for context in contexts {
+            for side in PaneSide.allCases where context[side].isSSH && !context[side].startupCommand.isEmpty {
+                guard let tab = context[side].tabs.first else { continue }
+                panes[context[side].trimmedHost, default: []].append((context.id, side, context.tmuxSession(side, for: tab)))
+            }
+        }
+        for (host, list) in panes {
+            let result = await Shell.remote(host, ClaudeHistory.remoteRegistryScript, timeout: 15)
+            guard result.ok else { continue }
+            let entries = ClaudeHistory.registryEntries(fromLines: result.stdout)
+            for (id, side, session) in list {
+                if let live = ClaudeHistory.liveSessionID(tmuxSession: session, entries: entries) {
+                    self[id, side] = live
+                }
+            }
         }
     }
 

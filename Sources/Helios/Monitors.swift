@@ -57,7 +57,8 @@ final class GitMonitor: ObservableObject {
     /// nil until read, or when the remote directory isn't a git repo.
     @Published private(set) var remote: RemoteStatus?
 
-    private let directory: String
+    /// Local checkout; nil when neither pane is on this Mac.
+    private let directory: String?
     let host: String?
     private let remoteDir: String
     private var remoteCheckedAt: Date?
@@ -65,7 +66,7 @@ final class GitMonitor: ObservableObject {
     /// Each remote read is an ssh round trip, so it runs less often than the local one.
     private static let remoteInterval: TimeInterval = 30
 
-    init(directory: String, host: String? = nil, remoteDir: String = "") {
+    init(directory: String?, host: String? = nil, remoteDir: String = "") {
         self.directory = directory
         self.host = host
         self.remoteDir = remoteDir.trimmingCharacters(in: .whitespaces)
@@ -85,7 +86,11 @@ final class GitMonitor: ObservableObject {
     }
 
     private func refreshLocal() async {
-        let dir = expandTilde(directory)
+        guard let directory else {
+            isRepo = false
+            return
+        }
+        let dir = expandTilde(directory.isEmpty ? "~" : directory)
         let status = await Shell.run("/usr/bin/git", ["-C", dir, "status", "--porcelain=v1", "-b"], timeout: 10)
         guard status.ok else {
             isRepo = false
