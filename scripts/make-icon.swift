@@ -1,5 +1,5 @@
-// Renders the Helios app icon to a 1024px PNG: two terminal panes (local and remote) joined by
-// a glowing bridge with a sun at its center, forming an "H".
+// Renders the Helios app icon to a 1024px PNG: a solar eclipse — a dark disk ringed by a glowing
+// corona — with a terminal prompt inside.
 // Usage: swift scripts/make-icon.swift <output.png>
 import AppKit
 
@@ -16,6 +16,9 @@ func gradient(_ colors: [NSColor], _ locations: [CGFloat]) -> NSGradient {
 func rounded(_ rect: CGRect, _ radius: CGFloat) -> NSBezierPath {
     NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
 }
+func circle(_ c: CGPoint, _ r: CGFloat) -> NSBezierPath {
+    NSBezierPath(ovalIn: CGRect(x: c.x - r, y: c.y - r, width: 2 * r, height: 2 * r))
+}
 
 let image = NSImage(size: NSSize(width: size, height: size), flipped: false) { _ in
     guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
@@ -23,89 +26,65 @@ let image = NSImage(size: NSSize(width: size, height: size), flipped: false) { _
     // macOS icon grid: ~824px body centered in the 1024 canvas.
     let body = CGRect(x: 100, y: 100, width: 824, height: 824)
     let squircle = rounded(body, 185)
+    let center = CGPoint(x: 512, y: 512)
+    let diskRadius: CGFloat = 252
 
     ctx.saveGState()
     ctx.setShadow(offset: CGSize(width: 0, height: -16), blur: 44, color: NSColor.black.withAlphaComponent(0.5).cgColor)
-    color(0x121212).setFill()
+    color(0x111111).setFill()
     squircle.fill()
     ctx.restoreGState()
 
     ctx.saveGState()
     squircle.addClip()
 
-    // Charcoal from the Ghostty theme, lit from above, with a warm bloom behind the bridge.
-    gradient([color(0x363636), color(0x1f1f1f), color(0x101010)], [0, 0.5, 1]).draw(in: body, angle: -90)
-    let center = CGPoint(x: 512, y: 512)
-    gradient([color(0xff8700, 0.42), color(0xff8700, 0.12), color(0xff8700, 0)], [0, 0.45, 1])
-        .draw(fromCenter: center, radius: 0, toCenter: center, radius: 420, options: [])
+    // Warm charcoal (the Ghostty theme's background, lit by the corona).
+    gradient([color(0x2a2522), color(0x0e0e0e)], [0, 1]).draw(in: body, angle: -90)
 
-    // The two panes: glassy pillars with a screen inset, a prompt, and a few lines of "output".
-    for x in [222.0, 634.0] as [CGFloat] {
-        let pillar = CGRect(x: x, y: 214, width: 168, height: 596)
-        ctx.saveGState()
-        ctx.setShadow(offset: CGSize(width: 0, height: -10), blur: 30, color: NSColor.black.withAlphaComponent(0.55).cgColor)
-        let shape = rounded(pillar, 52)
-        gradient([color(0x575757), color(0x2e2e2e), color(0x232323)], [0, 0.55, 1]).draw(in: shape, angle: -90)
-        ctx.restoreGState()
+    // Corona: a wide soft halo peaking just outside the disk.
+    gradient([color(0xff8700, 0), color(0xff8700, 0.58), color(0xffaf5f, 0.24), color(0xff8700, 0.06), color(0xff8700, 0)],
+             [0, 0.6, 0.7, 0.86, 1])
+        .draw(fromCenter: center, radius: 0, toCenter: center, radius: 430, options: [])
 
-        // Top-edge highlight and hairline border.
-        ctx.saveGState()
-        rounded(pillar, 52).addClip()
-        gradient([color(0xffffff, 0.16), color(0xffffff, 0)], [0, 1])
-            .draw(in: CGRect(x: pillar.minX, y: pillar.maxY - 120, width: pillar.width, height: 120), angle: -90)
-        ctx.restoreGState()
-        color(0xffffff, 0.14).setStroke()
-        let border = rounded(pillar.insetBy(dx: 1.5, dy: 1.5), 50)
-        border.lineWidth = 3
-        border.stroke()
-
-        // Screen inset.
-        let screen = rounded(pillar.insetBy(dx: 22, dy: 22), 34)
-        color(0x161616, 0.85).setFill()
-        screen.fill()
-
-        // Prompt ">" in the theme's blue, with a soft glow.
-        ctx.saveGState()
-        ctx.setShadow(offset: .zero, blur: 14, color: color(0x87afd7, 0.8).cgColor)
-        let prompt = NSBezierPath()
-        prompt.lineWidth = 17
-        prompt.lineCapStyle = .round
-        prompt.lineJoinStyle = .round
-        prompt.move(to: CGPoint(x: x + 50, y: 742))
-        prompt.line(to: CGPoint(x: x + 84, y: 718))
-        prompt.line(to: CGPoint(x: x + 50, y: 694))
-        color(0x87afd7).setStroke()
-        prompt.stroke()
-        ctx.restoreGState()
-
-        // Output lines below the bridge.
-        for (i, width) in [86.0, 58.0, 74.0].enumerated() {
-            let line = rounded(CGRect(x: x + 48, y: 372 - CGFloat(i) * 44, width: CGFloat(width), height: 14), 7)
-            color(0xbcbcbc, 0.32).setFill()
-            line.fill()
-        }
-    }
-
-    // The bridge between the panes (the SSH link), glowing.
+    // Bright rim: the sun's edge peeking around the moon.
     ctx.saveGState()
-    ctx.setShadow(offset: .zero, blur: 46, color: color(0xff8700, 0.95).cgColor)
-    let bridge = rounded(CGRect(x: 372, y: 480, width: 280, height: 64), 32)
-    gradient([color(0xff8700), color(0xffaf5f), color(0xffd787), color(0xffaf5f), color(0xff8700)],
-             [0, 0.25, 0.5, 0.75, 1]).draw(in: bridge, angle: 0)
+    ctx.setShadow(offset: .zero, blur: 42, color: color(0xffd787).cgColor)
+    gradient([color(0xfff1c7), color(0xffd787), color(0xffaf5f)], [0, 0.5, 1])
+        .draw(in: circle(center, diskRadius + 10), angle: 90)
     ctx.restoreGState()
 
-    // The sun at the center of the bridge.
+    // The disk, nudged down so the rim is thickest on top (lit from above), with a faint sheen.
+    let disk = circle(CGPoint(x: center.x, y: center.y - 4), diskRadius)
+    gradient([color(0x1d1c1b), color(0x0b0b0b)], [0, 1]).draw(in: disk, angle: -90)
     ctx.saveGState()
-    ctx.setShadow(offset: .zero, blur: 60, color: color(0xffd787).cgColor)
-    let sun = NSBezierPath(ovalIn: CGRect(x: center.x - 62, y: center.y - 62, width: 124, height: 124))
-    gradient([color(0xffffff), color(0xfff1c7), color(0xffd787)], [0, 0.45, 1])
-        .draw(in: sun, relativeCenterPosition: NSPoint(x: -0.25, y: 0.3))
+    disk.addClip()
+    gradient([color(0xffffff, 0.06), color(0xffffff, 0)], [0, 1])
+        .draw(fromCenter: CGPoint(x: center.x - 70, y: center.y + 120), radius: 0,
+              toCenter: CGPoint(x: center.x - 70, y: center.y + 120), radius: 260, options: [])
+    ctx.restoreGState()
+
+    // `>_` prompt, glowing, optically centered in the disk.
+    let s: CGFloat = 1.3
+    let origin = CGPoint(x: center.x - 96 * s + 2, y: center.y - 22 * s)
+    ctx.saveGState()
+    ctx.setShadow(offset: .zero, blur: 22, color: color(0xff8700, 0.9).cgColor)
+    let chevron = NSBezierPath()
+    chevron.lineWidth = 26 * s
+    chevron.lineCapStyle = .round
+    chevron.lineJoinStyle = .round
+    chevron.move(to: CGPoint(x: origin.x, y: origin.y + 60 * s))
+    chevron.line(to: CGPoint(x: origin.x + 52 * s, y: origin.y + 24 * s))
+    chevron.line(to: CGPoint(x: origin.x, y: origin.y - 12 * s))
+    color(0xffd787).setStroke()
+    chevron.stroke()
+    color(0xffd787).setFill()
+    rounded(CGRect(x: origin.x + 80 * s, y: origin.y - 25 * s, width: 72 * s, height: 26 * s), 13 * s).fill()
     ctx.restoreGState()
 
     ctx.restoreGState()
 
     // Hairline edge highlight.
-    color(0xffffff, 0.10).setStroke()
+    color(0xffffff, 0.09).setStroke()
     squircle.lineWidth = 3
     squircle.stroke()
     return true
